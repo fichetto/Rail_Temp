@@ -26,7 +26,7 @@ DallasTemperature sensors(&oneWire);
 
 #define uS_TO_S_FACTOR      1000000ULL  // Conversion factor for micro seconds to seconds
 #define TIME_TO_SLEEP       60          // Time ESP32 will go to sleep (in seconds)
-#define TIME_TO_SLEEP_LONG  3600        // Time ESP32 will go to sleep when battery is low (in seconds)
+#define TIME_TO_SLEEP_LONG  600        // Time ESP32 will go to sleep when battery is low (in seconds)
 
 #define UART_BAUD           115200       //uart modem
 #define PIN_DTR             25
@@ -35,7 +35,7 @@ DallasTemperature sensors(&oneWire);
 #define PWR_PIN             4
 
 #define LED_PIN             12
-#define SEND_INTERVAL_MS    30000        //Intervallo di tempo tra un invio dati e il successivo
+#define SEND_INTERVAL_MS    10000        //Intervallo di tempo tra un invio dati e il successivo
 
 #define BATTERY_PIN 35  // Definisci il pin ADC per la lettura della tensione della batteria
 
@@ -149,7 +149,7 @@ void IRAM_ATTR onPulse() {
 }
 
 float readBatteryVoltage() {
-    int analogValue = 4.1; //analogRead(BATTERY_PIN);
+    int analogValue = analogRead(BATTERY_PIN);
     float voltage = analogValue * (3.3 / 4095.0);  // 3.3V è la tensione di riferimento e 4095 è il valore massimo dell'ADC a 12 bit
     voltage *= 2; // Se c'è un partitore di tensione 1:2, moltiplica per 2
     return voltage;
@@ -241,23 +241,19 @@ int sentSampleCount = 0; // Variabile globale per contare i campioni inviati
 
 void SendMqttDataTask() {
   float batteryVoltage = readBatteryVoltage();
-  if (batteryVoltage < 3.3 && sentSampleCount >= 3) { // Condizione di spegnimento se sotto 30% e sono stati inviati almeno 3 campioni
+ 
+  if (sentSampleCount >= 3) { // Condizione di spegnimento se sotto 30% e sono stati inviati almeno 3 campioni
       SerialMon.println("Going in deep sleep mode");
       modemPowerOff();
       delay(5000); // Aggiungi un ritardo di 5 secondi per assicurarsi che il modem si spenga completamente
       goToDeepSleep(TIME_TO_SLEEP_LONG);
   }
-  // else {
-  //     SerialMon.print("Battery Volt:");
-  //     SerialMon.println(batteryVoltage);      
-  //     SerialMon.print("Sample Count:");
-  //     SerialMon.println(sampleCount);
-  // }
-
 
   if (connectionOK == true) {
     static unsigned long memMillisGPS = 0;
-    static float lat, lon, speed;
+    int year, month, day, hour, minute, second;
+    float lat, lon, speed, alt, accuracy;
+    int vsat, usat;
     static String Coord;
     static char charLat[10];
     static char charLon[10];
@@ -268,7 +264,7 @@ void SendMqttDataTask() {
     {
       memMillisGPS = millis();
 
-      if (modem.getGPS(&lat, &lon, &speed))
+      if (modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &accuracy, &year, &month, &day, &hour, &minute, &second))
       {
         //Serial.printf("lat:%f lon:%f\n", lat, lon);
         String Stringlat = String(lat, 6);
