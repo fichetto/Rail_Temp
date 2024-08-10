@@ -83,6 +83,11 @@ const char* topicAmpMotore = "Railtemp02/AmpMotore";
 const char* topicWatt = "Railtemp02/Watt";
 const char* topicTemperature = "Railtemp02/Temperature";
 
+// DeepSleep intervals
+uint64_t daySleepInterval = 600;  // 10 minuti in secondi
+uint64_t nightSleepInterval = 1800;  // 30 minuti in secondi
+
+
 TimeTrigger timerAccel;
 Timer timerButton;
 Timer timerSpecialBttFunction;
@@ -248,6 +253,7 @@ void SendMqttDataTask() {
       delay(5000); // Aggiungi un ritardo di 5 secondi per assicurarsi che il modem si spenga completamente
       goToDeepSleep(TIME_TO_SLEEP_LONG);
   }
+
 
   if (connectionOK == true) {
     static unsigned long memMillisGPS = 0;
@@ -444,14 +450,36 @@ void ConnectTask() {
   Connected = modem.isNetworkConnected();
 }
 
+// void goToDeepSleep(uint64_t time_in_seconds) {
+//       // Turn off GPS
+//     modem.sendAT("+SGPIO=0,4,1,0");
+//     modem.sendAT("AT+CPOWD=1");     // Power down the modem
+//     modem.poweroff();
+//     delay(1000); 
+//     pinMode(PWR_PIN, OUTPUT);
+//     digitalWrite(PWR_PIN, LOW);
+//     esp_sleep_enable_timer_wakeup(time_in_seconds * uS_TO_S_FACTOR);
+//     esp_deep_sleep_start();
+// }
 void goToDeepSleep(uint64_t time_in_seconds) {
-      // Turn off GPS
     modem.sendAT("+SGPIO=0,4,1,0");
-    modem.sendAT("AT+CPOWD=1");     // Power down the modem
+    modem.sendAT("AT+CPOWD=1");
     modem.poweroff();
     delay(1000); 
     pinMode(PWR_PIN, OUTPUT);
     digitalWrite(PWR_PIN, LOW);
+    
+    // Ottieni l'ora corrente dal GPS o dall'orologio interno
+    int year, month, day, hour, minute, second;
+    modem.getGPS(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &year, &month, &day, &hour, &minute, &second);
+    
+    // Imposta l'intervallo di deep sleep in base all'ora corrente
+    if (hour >= 6 && hour < 20) {
+        time_in_seconds = daySleepInterval;
+    } else {
+        time_in_seconds = nightSleepInterval;
+    }
+    
     esp_sleep_enable_timer_wakeup(time_in_seconds * uS_TO_S_FACTOR);
     esp_deep_sleep_start();
 }
