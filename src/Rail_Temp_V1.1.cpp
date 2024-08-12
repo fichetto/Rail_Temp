@@ -474,7 +474,7 @@ void goToDeepSleep(uint64_t time_in_seconds) {
     modem.getGPS(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &year, &month, &day, &hour, &minute, &second);
     
     // Imposta l'intervallo di deep sleep in base all'ora corrente
-    if (hour >= 6 && hour < 20) {
+    if (hour >= 6 && hour < 20) {  //if (hour >= 6 && hour < 20) { // Orario di greenwich
         time_in_seconds = daySleepInterval;
     } else {
         time_in_seconds = nightSleepInterval;
