@@ -62,7 +62,7 @@ const char gprsPass[] = "";
 
 const char server[] = "track.tecnocons.com";
 const int port = 5055;
-String myid = "20240729railtemp02";
+String myid = "20240729railtemp01";
 
 // Local WiFi Network credentials
 const char* ssid = "ESP32-AP";
@@ -71,17 +71,17 @@ const char* password = "123456789";
 // MQTT details
 const char* broker = "telemetry.tecnocons.com";
 
-const char* topicTestLed = "Railtemp02/TestLed";
-const char* topicStop = "Railtemp02/Stop";
-const char* topicStatus = "Railtemp02/Status";
+const char* topicTestLed = "railtemp01/TestLed";
+const char* topicStop = "railtemp01/Stop";
+const char* topicStatus = "railtemp01/Status";
 const char* topicInit = "GsmClientTest/init";
-const char* topicBatteryStatus = "Railtemp02/BatteryVoltage";
-const char* topicGPSlat = "Railtemp02/lat";
-const char* topicGPSlon = "Railtemp02/lon";
-const char* topicGPSspeed = "Railtemp02/speed";
-const char* topicAmpMotore = "Railtemp02/AmpMotore";
-const char* topicWatt = "Railtemp02/Watt";
-const char* topicTemperature = "Railtemp02/Temperature";
+const char* topicBatteryStatus = "railtemp01/BatteryVoltage";
+const char* topicGPSlat = "railtemp01/lat";
+const char* topicGPSlon = "railtemp01/lon";
+const char* topicGPSspeed = "railtemp01/speed";
+const char* topicAmpMotore = "railtemp01/AmpMotore";
+const char* topicWatt = "railtemp01/Watt";
+const char* topicTemperature = "railtemp01/Temperature";
 
 // DeepSleep intervals
 uint64_t daySleepInterval = 600;  // 10 minuti in secondi
@@ -209,15 +209,15 @@ void modemRestart() {
 boolean mqttConnect() {
   SerialMon.print("Connecting to ");
   SerialMon.print(broker);
-  boolean status = mqtt.connect("Railtemp02", "tecnocons", "nonserve");
+  boolean status = mqtt.connect("railtemp01", "tecnocons", "nonserve");
   if (status == false) {
     SerialMon.println(" fail");
     return false;
   }
   SerialMon.println(" success");
   mqtt.publish("GsmClientTest/init", "GsmClientTest started");
-  mqtt.subscribe("Railtemp02/TestLed");
-  mqtt.subscribe("Railtemp02/Stop");
+  mqtt.subscribe("railtemp01/TestLed");
+  mqtt.subscribe("railtemp01/Stop");
   return mqtt.connected();
 }
 
