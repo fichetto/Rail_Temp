@@ -156,7 +156,7 @@ void IRAM_ATTR onPulse() {
 float readBatteryVoltage() {
     int analogValue = analogRead(BATTERY_PIN);
     float voltage = analogValue * (3.3 / 4095.0);  // 3.3V è la tensione di riferimento e 4095 è il valore massimo dell'ADC a 12 bit
-    voltage *= 2; // Se c'è un partitore di tensione 1:2, moltiplica per 2
+    voltage *= 2.16; // Se c'è un partitore di tensione 1:2, moltiplica per 2
     return voltage;
 }
 
