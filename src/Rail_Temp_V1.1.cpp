@@ -62,7 +62,7 @@ const char gprsPass[] = "";
 
 const char server[] = "track.tecnocons.com";
 const int port = 5055;
-String myid = "20240729Railtemp01";
+String myid = "20240729Railtemp03";
 
 // Local WiFi Network credentials
 const char* ssid = "ESP32-AP";
@@ -71,17 +71,17 @@ const char* password = "123456789";
 // MQTT details
 const char* broker = "telemetry.tecnocons.com";
 
-const char* topicTestLed = "Railtemp01/TestLed";
-const char* topicStop = "Railtemp01/Stop";
-const char* topicStatus = "Railtemp01/Status";
+const char* topicTestLed = "Railtemp03/TestLed";
+const char* topicStop = "Railtemp03/Stop";
+const char* topicStatus = "Railtemp03/Status";
 const char* topicInit = "GsmClientTest/init";
-const char* topicBatteryStatus = "Railtemp01/BatteryVoltage";
-const char* topicGPSlat = "Railtemp01/lat";
-const char* topicGPSlon = "Railtemp01/lon";
-const char* topicGPSspeed = "Railtemp01/speed";
-const char* topicAmpMotore = "Railtemp01/AmpMotore";
-const char* topicWatt = "Railtemp01/Watt";
-const char* topicTemperature = "Railtemp01/Temperature";
+const char* topicBatteryStatus = "Railtemp03/BatteryVoltage";
+const char* topicGPSlat = "Railtemp03/lat";
+const char* topicGPSlon = "Railtemp03/lon";
+const char* topicGPSspeed = "Railtemp03/speed";
+const char* topicAmpMotore = "Railtemp03/AmpMotore";
+const char* topicWatt = "Railtemp03/Watt";
+const char* topicTemperature = "Railtemp03/Temperature";
 
 // DeepSleep intervals
 uint64_t daySleepInterval = 600;  // 10 minuti in secondi
@@ -117,6 +117,7 @@ bool Connected = false;
 unsigned int mqttSent = 0;
 
 float TensioneBatt;
+float batteryVoltage;
 
 // Additional sensor pins
 const int analogPin1 = 34; // Sensore di pressione 1
@@ -209,15 +210,15 @@ void modemRestart() {
 boolean mqttConnect() {
   SerialMon.print("Connecting to ");
   SerialMon.print(broker);
-  boolean status = mqtt.connect("Railtemp01", "tecnocons", "nonserve");
+  boolean status = mqtt.connect("Railtemp03", "tecnocons", "nonserve");
   if (status == false) {
     SerialMon.println(" fail");
     return false;
   }
   SerialMon.println(" success");
   mqtt.publish("GsmClientTest/init", "GsmClientTest started");
-  mqtt.subscribe("Railtemp01/TestLed");
-  mqtt.subscribe("Railtemp01/Stop");
+  mqtt.subscribe("Railtemp03/TestLed");
+  mqtt.subscribe("Railtemp03/Stop");
   return mqtt.connected();
 }
 
@@ -245,12 +246,13 @@ int sentSampleCount = 0; // Variabile globale per contare i campioni inviati
 
 
 void SendMqttDataTask() {
-  float batteryVoltage = readBatteryVoltage();
+  batteryVoltage = readBatteryVoltage();
  
-  if (sentSampleCount >= 3) { // Condizione di spegnimento se sotto 30% e sono stati inviati almeno 3 campioni
+  // Modifica la condizione per il deep sleep
+  if (sentSampleCount >= 3 && batteryVoltage > 0) { // Verifica che non siamo alimentati via USB
       SerialMon.println("Going in deep sleep mode");
       modemPowerOff();
-      delay(5000); // Aggiungi un ritardo di 5 secondi per assicurarsi che il modem si spenga completamente
+      delay(5000);
       goToDeepSleep(TIME_TO_SLEEP_LONG);
   }
 
@@ -293,16 +295,29 @@ void SendMqttDataTask() {
       }
     }
 
-    if (!mqtt.connected()) {
-      uint32_t t = millis();
-      if (t - lastReconnectAttempt > 10000L) {
-        Serial.println("=== MQTT NOT CONNECTED ===");
+if (!mqtt.connected()) {
+    uint32_t t = millis();
+    if (t - lastReconnectAttempt > 10000L) {
+        SerialMon.println("=== MQTT NOT CONNECTED ===");
         lastReconnectAttempt = t;
-        if (mqttConnect()) { lastReconnectAttempt = 0; }
-      }
-      delay(100);
-      return;
+        
+        // Verifica prima lo stato della connessione GPRS
+        if (!modem.isGprsConnected()) {
+            SerialMon.println("GPRS connection lost - Resetting connection...");
+            connectionOK = false;  // Forza riconnessione in ConnectTask
+            return;
+        }
+        
+        if (mqttConnect()) {
+            lastReconnectAttempt = 0;
+            SerialMon.println("MQTT reconnected successfully");
+        } else {
+            SerialMon.println("MQTT reconnection failed");
+        }
     }
+    delay(100);
+    return;
+}
     else {  //se mqtt connesso
       mqtt.loop();
       //Send voltage over MQTT
@@ -407,61 +422,132 @@ void disableGPS() {
 }
 
 void ConnectTask() {
-  if (!connectionOK) {
-    String res;
-    if (!modem.init()) {
-      modemRestart();
-      delay(2000);
-      return;
+    if (!connectionOK || !modem.isGprsConnected()) {  // Aggiungiamo il controllo GPRS
+        String res;
+        
+        // Verifica lo stato del modem
+        if (!modem.testAT()) {
+            SerialMon.println("Modem not responding - Restarting...");
+            modemRestart();
+            delay(2000);
+            return;
+        }
+
+        // Se il modem risponde ma non siamo connessi, proviamo a reinizializzare
+        if (!modem.init()) {
+            SerialMon.println("Modem init failed - Restarting...");
+            modemRestart();
+            delay(2000);
+            return;
+        }
+
+        SerialMon.println("Setting network mode...");
+        modem.setNetworkMode(13);    // Force LTE only
+        modem.setPreferredMode(1);
+        delay(500);
+
+        // Verifica la connessione alla rete
+        for (int i = 0; i < 5; i++) {
+            SerialMon.println("Checking network connection...");
+            bool isConnected = false;
+            int tryCount = 30;  // Ridotto da 60 a 30 per una risposta più rapida
+            
+            while (tryCount-- && !isConnected) {
+                int16_t signal = modem.getSignalQuality();
+                SerialMon.printf("Signal quality: %d\n", signal);
+                
+                isConnected = modem.isNetworkConnected();
+                if (isConnected) {
+                    SerialMon.println("Network connected!");
+                    break;
+                }
+                delay(1000);
+                digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+            }
+            
+            if (isConnected) break;
+            
+            if (i < 4) {  // Non attendere dopo l'ultimo tentativo
+                SerialMon.println("Network connection failed, retrying...");
+                delay(3000);
+            }
+        }
+
+        digitalWrite(LED_PIN, HIGH);
+
+        // Verifica stato rete
+        modem.sendAT("+CPSI?");
+        if (modem.waitResponse(1000L, res) == 1) {
+            SerialMon.println("Network status: " + res);
+        }
+
+        // Connessione GPRS
+        SerialMon.println("Connecting to GPRS...");
+        if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+            SerialMon.println("GPRS connection failed");
+            delay(10000);
+            return;
+        }
+        
+        SerialMon.println("GPRS connected!");
+        connectionOK = true;
     }
 
-    modem.setNetworkMode(13);
-    modem.setPreferredMode(1);
-
-    for (int i = 0; i <= 4; i++) {
-      modem.setNetworkMode(13);
-      modem.setPreferredMode(1);
-      delay(3000);
-
-      bool isConnected = false;
-      int tryCount = 60;
-      while (tryCount--) {
-        int16_t signal = modem.getSignalQuality();
-        isConnected = modem.isNetworkConnected();
-        if (isConnected) break;
-        delay(1000);
-        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-      }
-      if (isConnected) break;
+    // Aggiorna lo stato della connessione
+    SignalQuality = modem.getSignalQuality();
+    Connected = modem.isNetworkConnected() && modem.isGprsConnected();
+    
+    // Se perdiamo la connessione, forza una riconnessione al prossimo ciclo
+    if (!Connected) {
+        SerialMon.println("Connection lost - Will reconnect on next cycle");
+        connectionOK = false;
+    } else {
+        // Stampa periodicamente lo stato della connessione
+        static unsigned long lastStatusPrint = 0;
+        if (millis() - lastStatusPrint > 30000) {  // Ogni 30 secondi
+            lastStatusPrint = millis();
+            SerialMon.printf("Signal Quality: %d, GPRS Connected: %s\n", 
+                           SignalQuality, 
+                           modem.isGprsConnected() ? "YES" : "NO");
+        }
     }
-    digitalWrite(LED_PIN, HIGH);
-
-    modem.sendAT("+CPSI?");
-    modem.waitResponse(1000L, res);
-
-    if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
-      delay(10000);
-      return;
-    }
-
-    connectionOK = true;
-  }
-  SignalQuality = modem.getSignalQuality();
-  Connected = modem.isNetworkConnected();
 }
 
-// void goToDeepSleep(uint64_t time_in_seconds) {
-//       // Turn off GPS
-//     modem.sendAT("+SGPIO=0,4,1,0");
-//     modem.sendAT("AT+CPOWD=1");     // Power down the modem
-//     modem.poweroff();
-//     delay(1000); 
-//     pinMode(PWR_PIN, OUTPUT);
-//     digitalWrite(PWR_PIN, LOW);
-//     esp_sleep_enable_timer_wakeup(time_in_seconds * uS_TO_S_FACTOR);
-//     esp_deep_sleep_start();
-// }
+// Definizioni per gli orari stagionali (orari approssimativi medi per l'Italia)
+struct SeasonTime {
+    int startMonth;
+    int endMonth;
+    int sunriseHour;
+    int sunsetHour;
+};
+
+const SeasonTime seasons[] = {
+    {1,  2,  7, 17},  // Inverno (Gennaio-Febbraio)
+    {3,  4,  6, 19},  // Primavera precoce (Marzo-Aprile)
+    {5,  8,  5, 21},  // Estate (Maggio-Agosto)
+    {9,  10, 6, 19},  // Autunno precoce (Settembre-Ottobre)
+    {11, 12, 7, 17}   // Inverno (Novembre-Dicembre)
+};
+
+bool isDST(int day, int month) {
+    // Ora legale in Europa: ultima domenica di marzo - ultima domenica di ottobre
+    if (month < 3 || month > 10) return false;
+    if (month > 3 && month < 10) return true;
+    
+    // Approssimazione semplificata: consideriamo dopo il 25 del mese
+    return (month == 3 && day >= 25) || (month == 10 && day < 25);
+}
+
 void goToDeepSleep(uint64_t time_in_seconds) {
+    float batteryVoltage = readBatteryVoltage();
+    
+    // Se batteryVoltage è 0, significa che siamo alimentati via USB
+    if (batteryVoltage == 0) {
+        SerialMon.println("USB Power detected - Skip deep sleep");
+        sentSampleCount = 0; // Azzera il contatore quando siamo su USB
+        return; // Esce dalla funzione senza entrare in deep sleep
+    }
+
     modem.sendAT("+SGPIO=0,4,1,0");
     modem.sendAT("AT+CPOWD=1");
     modem.poweroff();
@@ -469,21 +555,52 @@ void goToDeepSleep(uint64_t time_in_seconds) {
     pinMode(PWR_PIN, OUTPUT);
     digitalWrite(PWR_PIN, LOW);
     
-    // Ottieni l'ora corrente dal GPS o dall'orologio interno
-    int year, month, day, hour, minute, second;
-    modem.getGPS(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &year, &month, &day, &hour, &minute, &second);
-    
-    // Imposta l'intervallo di deep sleep in base all'ora corrente
-    if (hour >= 6 && hour < 20) {  //if (hour >= 6 && hour < 20) { // Orario di greenwich
-        time_in_seconds = daySleepInterval;
+    // Se la batteria è sotto 3.6V, imposta sleep di 1 ora indipendentemente dall'ora del giorno
+    if (batteryVoltage <= 3.7) {
+        time_in_seconds = 3600; // 1 ora in secondi
+        SerialMon.println("Low battery - Setting 1 hour sleep interval");
     } else {
-        time_in_seconds = nightSleepInterval;
+        // Ottieni l'ora corrente dal GPS o dall'orologio interno
+        int year, month, day, hour, minute, second;
+        modem.getGPS(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 
+                    &year, &month, &day, &hour, &minute, &second);
+        
+        // Trova la stagione corrente
+        const SeasonTime* currentSeason = &seasons[0];
+        for (int i = 0; i < 5; i++) {
+            if (month >= seasons[i].startMonth && month <= seasons[i].endMonth) {
+                currentSeason = &seasons[i];
+                break;
+            }
+        }
+        
+        // Applica correzione per ora legale
+        int hourOffset = isDST(day, month) ? 2 : 1; // GMT+1 (ora solare) o GMT+2 (ora legale)
+        int localHour = (hour + hourOffset) % 24;
+        
+        // Imposta l'intervallo di deep sleep in base all'ora locale e alla stagione
+        if (localHour >= currentSeason->sunriseHour && 
+            localHour < currentSeason->sunsetHour) {
+            time_in_seconds = daySleepInterval;    // 10 minuti
+            SerialMon.println("Daylight period - Setting 10 minutes sleep interval");
+        } else {
+            time_in_seconds = nightSleepInterval;  // 30 minuti
+            SerialMon.println("Night period - Setting 30 minutes sleep interval");
+        }
+        
+        SerialMon.printf("Current time: %02d:%02d (GMT+%d), Month: %d\n", 
+                        localHour, minute, hourOffset, month);
+        SerialMon.printf("Season limits - Sunrise: %02d:00, Sunset: %02d:00\n", 
+                        currentSeason->sunriseHour, currentSeason->sunsetHour);
     }
+    
+    SerialMon.print("Going to deep sleep for ");
+    SerialMon.print(time_in_seconds);
+    SerialMon.println(" seconds");
     
     esp_sleep_enable_timer_wakeup(time_in_seconds * uS_TO_S_FACTOR);
     esp_deep_sleep_start();
 }
-
 
 void setup() {
   SerialMon.begin(115200);
