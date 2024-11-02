@@ -513,7 +513,6 @@ void ConnectTask() {
     }
 }
 
-// Definizioni per gli orari stagionali (orari approssimativi medi per l'Italia)
 struct SeasonTime {
     int startMonth;
     int endMonth;
@@ -533,19 +532,41 @@ bool isDST(int day, int month) {
     // Ora legale in Europa: ultima domenica di marzo - ultima domenica di ottobre
     if (month < 3 || month > 10) return false;
     if (month > 3 && month < 10) return true;
-    
-    // Approssimazione semplificata: consideriamo dopo il 25 del mese
     return (month == 3 && day >= 25) || (month == 10 && day < 25);
+}
+
+bool isDaylight(int localHour, const SeasonTime* season) {
+    // Aggiunta di un controllo più rigoroso
+    if (localHour < 0 || localHour >= 24) {
+        SerialMon.println("WARNING: Invalid hour value!");
+        return false; // In caso di errore, considera notte per sicurezza
+    }
+    
+    bool isDaytime = (localHour >= season->sunriseHour && localHour < season->sunsetHour);
+    SerialMon.print("Hour check: ");
+    SerialMon.print(localHour);
+    SerialMon.print(" is ");
+    SerialMon.print(isDaytime ? "DAY" : "NIGHT");
+    SerialMon.print(" (Sunrise: ");
+    SerialMon.print(season->sunriseHour);
+    SerialMon.print(", Sunset: ");
+    SerialMon.print(season->sunsetHour);
+    SerialMon.println(")");
+    
+    return isDaytime;
 }
 
 void goToDeepSleep(uint64_t time_in_seconds) {
     float batteryVoltage = readBatteryVoltage();
     
-    // Se batteryVoltage è 0, significa che siamo alimentati via USB
+    // Log della tensione della batteria
+    SerialMon.print("Battery Voltage: ");
+    SerialMon.println(batteryVoltage);
+    
     if (batteryVoltage == 0) {
         SerialMon.println("USB Power detected - Skip deep sleep");
-        sentSampleCount = 0; // Azzera il contatore quando siamo su USB
-        return; // Esce dalla funzione senza entrare in deep sleep
+        sentSampleCount = 0;
+        return;
     }
 
     modem.sendAT("+SGPIO=0,4,1,0");
@@ -555,43 +576,58 @@ void goToDeepSleep(uint64_t time_in_seconds) {
     pinMode(PWR_PIN, OUTPUT);
     digitalWrite(PWR_PIN, LOW);
     
-    // Se la batteria è sotto 3.6V, imposta sleep di 1 ora indipendentemente dall'ora del giorno
     if (batteryVoltage <= 3.7) {
-        time_in_seconds = 3600; // 1 ora in secondi
+        time_in_seconds = 3600;
         SerialMon.println("Low battery - Setting 1 hour sleep interval");
     } else {
-        // Ottieni l'ora corrente dal GPS o dall'orologio interno
         int year, month, day, hour, minute, second;
-        modem.getGPS(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 
-                    &year, &month, &day, &hour, &minute, &second);
+        bool gpsTimeOk = modem.getGPS(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 
+                                     &year, &month, &day, &hour, &minute, &second);
         
-        // Trova la stagione corrente
-        const SeasonTime* currentSeason = &seasons[0];
-        for (int i = 0; i < 5; i++) {
-            if (month >= seasons[i].startMonth && month <= seasons[i].endMonth) {
-                currentSeason = &seasons[i];
-                break;
+        // Verifica se abbiamo ottenuto un'ora valida dal GPS
+        if (!gpsTimeOk || hour < 0 || hour >= 24) {
+            SerialMon.println("Invalid GPS time - Defaulting to night interval");
+            time_in_seconds = nightSleepInterval;
+        } else {
+            // Log dei dati temporali ricevuti dal GPS
+            SerialMon.printf("GPS Time - Hour: %d, Day: %d, Month: %d\n", hour, day, month);
+            
+            // Trova la stagione corrente
+            const SeasonTime* currentSeason = nullptr;
+            for (int i = 0; i < 5; i++) {
+                if (month >= seasons[i].startMonth && month <= seasons[i].endMonth) {
+                    currentSeason = &seasons[i];
+                    SerialMon.printf("Season found: %d-%d\n", 
+                                   seasons[i].startMonth, seasons[i].endMonth);
+                    break;
+                }
+            }
+            
+            // Verifica se abbiamo trovato una stagione valida
+            if (currentSeason == nullptr) {
+                SerialMon.println("Invalid season - Defaulting to night interval");
+                time_in_seconds = nightSleepInterval;
+            } else {
+                int hourOffset = isDST(day, month) ? 2 : 1;
+                int localHour = (hour + hourOffset) % 24;
+                
+                SerialMon.printf("Time calculation: GMT %d + offset %d = local hour %d\n", 
+                               hour, hourOffset, localHour);
+                
+                if (isDaylight(localHour, currentSeason)) {
+                    time_in_seconds = daySleepInterval;    // 10 minuti
+                    SerialMon.println("Daylight confirmed - Setting 10 minutes sleep interval");
+                } else {
+                    time_in_seconds = nightSleepInterval;  // 30 minuti
+                    SerialMon.println("Night confirmed - Setting 30 minutes sleep interval");
+                }
+                
+                SerialMon.printf("Final time check - Local: %02d:%02d (GMT+%d), Month: %d\n", 
+                               localHour, minute, hourOffset, month);
+                SerialMon.printf("Season limits - Sunrise: %02d:00, Sunset: %02d:00\n", 
+                               currentSeason->sunriseHour, currentSeason->sunsetHour);
             }
         }
-        
-        // Applica correzione per ora legale
-        int hourOffset = isDST(day, month) ? 2 : 1; // GMT+1 (ora solare) o GMT+2 (ora legale)
-        int localHour = (hour + hourOffset) % 24;
-        
-        // Imposta l'intervallo di deep sleep in base all'ora locale e alla stagione
-        if (localHour >= currentSeason->sunriseHour && 
-            localHour < currentSeason->sunsetHour) {
-            time_in_seconds = daySleepInterval;    // 10 minuti
-            SerialMon.println("Daylight period - Setting 10 minutes sleep interval");
-        } else {
-            time_in_seconds = nightSleepInterval;  // 30 minuti
-            SerialMon.println("Night period - Setting 30 minutes sleep interval");
-        }
-        
-        SerialMon.printf("Current time: %02d:%02d (GMT+%d), Month: %d\n", 
-                        localHour, minute, hourOffset, month);
-        SerialMon.printf("Season limits - Sunrise: %02d:00, Sunset: %02d:00\n", 
-                        currentSeason->sunriseHour, currentSeason->sunsetHour);
     }
     
     SerialMon.print("Going to deep sleep for ");
