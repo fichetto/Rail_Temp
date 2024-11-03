@@ -49,6 +49,20 @@ DallasTemperature sensors(&oneWire);
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
 
+//Provisioning Device ID  
+#include <WebServer.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+
+// Definizioni per il Web Server
+WebServer webServer(80);
+const char* ap_ssid = "RailTemp-Setup";
+const char* ap_password = "12345678";
+
+// File di configurazione su SPIFFS
+const char* config_file = "/config.json";
+String deviceId = "RailTemp00"; // Default ID    
+
 // SD card pin assignments
 const int pinCS = 13;   // Chip Select for SD card
 const int pinMOSI = 15; // Master Out Slave In
@@ -154,6 +168,94 @@ void IRAM_ATTR onPulse() {
   pulseCount++;
 }
 
+//Provisioning Device ID  
+
+// Funzioni per caricare/salvare la configurazione
+void loadConfiguration() {
+    if (SPIFFS.begin(true)) {
+        File configFile = SPIFFS.open(config_file, "r");
+        if (configFile) {
+            JsonDocument doc;  // Usando JsonDocument invece di DynamicJsonDocument
+            DeserializationError error = deserializeJson(doc, configFile);
+            if (!error) {
+                deviceId = doc["deviceId"].as<String>();
+            }
+            configFile.close();
+        }
+    }
+}
+
+void saveConfiguration() {
+    if (SPIFFS.begin(true)) {
+        File configFile = SPIFFS.open(config_file, "w");
+        if (configFile) {
+            JsonDocument doc;  // Usando JsonDocument invece di StaticJsonDocument
+            doc["deviceId"] = deviceId;
+            serializeJson(doc, configFile);
+            configFile.close();
+        }
+    }
+}
+
+// Pagina HTML per la configurazione
+const char* html_page = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RailTemp Setup</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        .container { max-width: 400px; margin: 0 auto; }
+        input, button { width: 100%; padding: 10px; margin: 10px 0; }
+        button { background-color: #4CAF50; color: white; border: none; }
+        .status { margin-top: 20px; padding: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>RailTemp Setup</h1>
+        <form action="/save" method="POST">
+            <label>Device ID:</label>
+            <input type="text" name="deviceId" value="%s" pattern="RailTemp[0-9]{2}" 
+                   title="Format: RailTempXX (XX are numbers)">
+            <button type="submit">Save</button>
+        </form>
+        <div class="status">Current ID: %s</div>
+    </div>
+</body>
+</html>
+)rawliteral";
+
+void setupAP() {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(ap_ssid, ap_password);
+    
+    webServer.on("/", HTTP_GET, []() {
+        char temp[1500];
+        snprintf(temp, sizeof(temp), html_page, deviceId.c_str(), deviceId.c_str());
+        webServer.send(200, "text/html", temp);
+    });
+    
+    webServer.on("/save", HTTP_POST, []() {
+        if (webServer.hasArg("deviceId")) {
+            String newId = webServer.arg("deviceId");
+            if (newId.startsWith("RailTemp") && newId.length() == 10) {
+                deviceId = newId;
+                saveConfiguration();
+                webServer.send(200, "text/html", 
+                    "<html><body><h2>Saved!</h2><script>setTimeout(function(){window.location.href='/';},1000);</script></body></html>");
+            } else {
+                webServer.send(400, "text/html", "Invalid ID format");
+            }
+        }
+    });
+    
+    webServer.begin();
+    SerialMon.println("AP Web Server started");
+}
+
+
 float readBatteryVoltage() {
     int analogValue = analogRead(BATTERY_PIN);
     float voltage = analogValue * (3.3 / 4095.0);  // 3.3V è la tensione di riferimento e 4095 è il valore massimo dell'ADC a 12 bit
@@ -207,40 +309,85 @@ void modemRestart() {
   modemPowerOn();
 }
 
+// Modificare la funzione mqttConnect per usare l'ID dinamico
 boolean mqttConnect() {
-  SerialMon.print("Connecting to ");
-  SerialMon.print(broker);
-  boolean status = mqtt.connect("Railtemp03", "tecnocons", "nonserve");
-  if (status == false) {
-    SerialMon.println(" fail");
-    return false;
-  }
-  SerialMon.println(" success");
-  mqtt.publish("GsmClientTest/init", "GsmClientTest started");
-  mqtt.subscribe("Railtemp03/TestLed");
-  mqtt.subscribe("Railtemp03/Stop");
-  return mqtt.connected();
+    SerialMon.print("Connecting to ");
+    SerialMon.print(broker);
+    
+    // Usa deviceId invece dell'ID hardcoded
+    boolean status = mqtt.connect(deviceId.c_str(), "tecnocons", "nonserve");
+    
+    if (status == false) {
+        SerialMon.println(" fail");
+        return false;
+    }
+    SerialMon.println(" success");
+
+    // Pubblica il messaggio di init con il nuovo ID
+    String initTopic = deviceId + "/init";
+    mqtt.publish(initTopic.c_str(), "Device started");
+
+    // Sottoscrizione ai topic con il nuovo ID
+    String testLedTopic = deviceId + "/TestLed";
+    String stopTopic = deviceId + "/Stop";
+    
+    mqtt.subscribe(testLedTopic.c_str());
+    mqtt.subscribe(stopTopic.c_str());
+
+    return mqtt.connected();
 }
+
 
 void SendDataToTraccar(float lat, float lon) {
-  String latStr = String(lat, 6);
-  String lonStr = String(lon, 6);
+    String latStr = String(lat, 6);
+    String lonStr = String(lon, 6);
 
-  int err = http.post("/?id=" + myid + "&lat=" + latStr + "&lon=" + lonStr);
-  if (err != 0) {
-    delay(10000);
-    return;
-  }
+    // Usa deviceId invece dell'ID hardcoded
+    int err = http.post("/?id=" + deviceId + "&lat=" + latStr + "&lon=" + lonStr);
+    if (err != 0) {
+        delay(10000);
+        return;
+    }
 
-  int status = http.responseStatusCode();
-  if (!status) {
-    delay(10000);
-    return;
-  }
+    int status = http.responseStatusCode();
+    if (!status) {
+        delay(10000);
+        return;
+    }
 
-  String body = http.responseBody();
-  http.stop();
+    String body = http.responseBody();
+    http.stop();
 }
+
+
+
+// Modificare le definizioni dei topic MQTT per usare l'ID variabile
+void updateMqttTopics() {
+    // Buffer per costruire i topic
+    static char topicTestLed[50];
+    static char topicStop[50];
+    static char topicStatus[50];
+    static char topicBatteryStatus[50];
+    static char topicGPSlat[50];
+    static char topicGPSlon[50];
+    static char topicGPSspeed[50];
+    static char topicAmpMotore[50];
+    static char topicWatt[50];
+    static char topicTemperature[50];
+
+    // Costruzione dei topic con l'ID corrente
+    snprintf(topicTestLed, sizeof(topicTestLed), "%s/TestLed", deviceId.c_str());
+    snprintf(topicStop, sizeof(topicStop), "%s/Stop", deviceId.c_str());
+    snprintf(topicStatus, sizeof(topicStatus), "%s/Status", deviceId.c_str());
+    snprintf(topicBatteryStatus, sizeof(topicBatteryStatus), "%s/BatteryVoltage", deviceId.c_str());
+    snprintf(topicGPSlat, sizeof(topicGPSlat), "%s/lat", deviceId.c_str());
+    snprintf(topicGPSlon, sizeof(topicGPSlon), "%s/lon", deviceId.c_str());
+    snprintf(topicGPSspeed, sizeof(topicGPSspeed), "%s/speed", deviceId.c_str());
+    snprintf(topicAmpMotore, sizeof(topicAmpMotore), "%s/AmpMotore", deviceId.c_str());
+    snprintf(topicWatt, sizeof(topicWatt), "%s/Watt", deviceId.c_str());
+    snprintf(topicTemperature, sizeof(topicTemperature), "%s/Temperature", deviceId.c_str());
+}
+
 
 int sentSampleCount = 0; // Variabile globale per contare i campioni inviati
 
@@ -393,27 +540,36 @@ if (!mqtt.connected()) {
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
-  SerialMon.print("Message arrived [");
-  SerialMon.print(topic);
-  SerialMon.print("]: ");
-  SerialMon.write(payload, len);
-  SerialMon.println();
+    SerialMon.print("Message arrived [");
+    SerialMon.print(topic);
+    SerialMon.print("]: ");
+    SerialMon.write(payload, len);
+    SerialMon.println();
 
-  if (String(topic) == topicTestLed) {
-    ledStatus = !ledStatus;
-    digitalWrite(LED_PIN, ledStatus);
-    mqtt.publish(topicStatus, ledStatus ? "1" : "0");
-  }
+    // Costruisci i topic di confronto
+    String testLedTopic = deviceId + "/TestLed";
+    String stopTopic = deviceId + "/Stop";
 
-  if (String(topic) == topicStop) {
-    if (strncmp((char*)payload, "STOP", len) == 0) {
-      MQTTcommandStop = true;
+    if (String(topic) == testLedTopic) {
+        ledStatus = !ledStatus;
+        digitalWrite(LED_PIN, ledStatus);
+        
+        String statusTopic = deviceId + "/Status";
+        mqtt.publish(statusTopic.c_str(), ledStatus ? "1" : "0");
     }
-    if (strncmp((char*)payload, "START", len) == 0) {
-      MQTTcommandStop = false;
+
+    if (String(topic) == stopTopic) {
+        if (strncmp((char*)payload, "STOP", len) == 0) {
+            MQTTcommandStop = true;
+        }
+        if (strncmp((char*)payload, "START", len) == 0) {
+            MQTTcommandStop = false;
+        }
+        
+        String statusTopic = deviceId + "/Status";
+        mqtt.publish(statusTopic.c_str(), 
+            MQTTcommandStop ? "Ebike Stopped!" : "Ebike Operational!");
     }
-    mqtt.publish(topicStatus, MQTTcommandStop ? "Ebike Stopped!" : "Ebike Operational!");
-  }
 }
 
 void disableGPS() {
@@ -643,6 +799,10 @@ void setup() {
   OPENLOG_SERIAL.begin(9600, SERIAL_8N1, OPENLOG_RX, OPENLOG_TX);
   delay(1000);
   
+  loadConfiguration();  // Carica l'ID del dispositivo
+  updateMqttTopics();  // Aggiorna i topic MQTT con il nuovo ID
+
+
   sensors.begin();  // Inizializza il sensore DS18B20
 
   WiFi.mode(WIFI_OFF);
