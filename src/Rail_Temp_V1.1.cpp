@@ -96,6 +96,7 @@ const char* topicGPSspeed = "Railtemp03/speed";
 const char* topicAmpMotore = "Railtemp03/AmpMotore";
 const char* topicWatt = "Railtemp03/Watt";
 const char* topicTemperature = "Railtemp03/Temperature";
+const char* topicSignalLevel = "Railtemp03/SignalLevel";  // Aggiungi questa riga dopo gli altri topic
 
 // DeepSleep intervals
 uint64_t daySleepInterval = 600;  // 10 minuti in secondi
@@ -415,6 +416,27 @@ void SendMqttDataTask() {
     static char charSpeed[10];
     static char charCoord[20];
     static bool GPSdataAvailable;
+
+
+    // Aggiungi il controllo del livello del segnale
+    static unsigned long lastSignalCheck = 0;
+    if (millis() - lastSignalCheck >= SEND_INTERVAL_MS) {
+      lastSignalCheck = millis();
+      
+      // Ottieni il livello del segnale
+      int signalQuality = modem.getSignalQuality();
+      String signalStr = String(signalQuality);
+      char charSignal[5];
+      signalStr.toCharArray(charSignal, 5);
+      
+      // Pubblica il livello del segnale
+      if (mqtt.connected()) {
+        mqtt.publish(topicSignalLevel, charSignal);
+        SerialMon.print("Signal Level sent: ");
+        SerialMon.println(signalQuality);
+      }
+    }
+
     if (millis() >= memMillisGPS + SEND_INTERVAL_MS)
     {
       memMillisGPS = millis();
