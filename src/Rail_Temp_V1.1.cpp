@@ -817,6 +817,20 @@ void goToDeepSleep(uint64_t time_in_seconds) {
 }
 
 void setup() {
+
+    // Pin alla stato Hi-Z (alta impedenza)
+    pinMode(18, INPUT);
+    pinMode(19, INPUT);
+
+    // Inizializzazione SerialMon per debug
+    SerialMon.begin(115200);
+    delay(100);
+
+    // Inizializzazione SerialAT per il modem
+    SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+    delay(100);
+    
+    // Resto del codice...
   SerialMon.begin(115200);
   OPENLOG_SERIAL.begin(9600, SERIAL_8N1, OPENLOG_RX, OPENLOG_TX);
   delay(1000);
