@@ -51,10 +51,12 @@ WebServer webServer(80);
 const char* ap_ssid = "RailTemp-Setup";
 const char* ap_password = "12345678";
 const char* config_file = "/config.json";
-String deviceId = "RailTemp00";
 
-// Connessione GPRS
-const char apn[] = "shared.tids.tim.it";
+// Configurazioni modificabili
+String deviceId = "RailTemp00";
+String apnConfig = "shared.tids.tim.it";  // APN configurabile
+
+// Credenziali GPRS (solitamente vuote)
 const char gprsUser[] = "";
 const char gprsPass[] = "";
 
@@ -133,23 +135,44 @@ const char* html_page = R"rawliteral(
     <style>
         body { font-family: Arial; margin: 20px; }
         .container { max-width: 400px; margin: 0 auto; }
-        input, button { width: 100%; padding: 10px; margin: 10px 0; }
-        button { background-color: #4CAF50; color: white; border: none; }
-        .status { margin-top: 20px; padding: 10px; background: #f0f0f0; }
+        input, button { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; }
+        button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #45a049; }
+        .status { margin-top: 20px; padding: 10px; background: #f0f0f0; border-radius: 5px; }
+        .info { margin: 20px 0; padding: 15px; background: #e7f3ff; border-radius: 5px; }
+        label { font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>RailTemp Setup</h1>
+        <div class="info">
+            <strong>Modalità Configurazione</strong><br>
+            Configura ID dispositivo e APN operatore
+        </div>
         <form action="/save" method="POST">
             <label>Device ID:</label>
             <input type="text" name="deviceId" value="%s" pattern="RailTemp[0-9]{2}" 
-                   title="Format: RailTempXX (XX are numbers)" required>
-            <button type="submit">Save Configuration</button>
+                   title="Format: RailTempXX (XX sono numeri)" required>
+            
+            <label>APN Operatore:</label>
+            <input type="text" name="apn" value="%s" 
+                   placeholder="es: ibox.tim.it" required>
+            
+            <button type="submit">Salva Configurazione</button>
         </form>
         <div class="status">
-            <strong>Current ID:</strong> %s<br>
-            <strong>Status:</strong> Configuration Mode
+            <strong>Configurazione Attuale:</strong><br>
+            ID: %s<br>
+            APN: %s<br>
+            <hr>
+            <small>
+            APN comuni:<br>
+            • TIM: shared.tids.tim.it<br>
+            • Vodafone: web.omnitel.it<br>
+            • WindTre: internet.it<br>
+            • Iliad: iliad
+            </small>
         </div>
     </div>
 </body>
@@ -165,8 +188,13 @@ void loadConfiguration() {
             DeserializationError error = deserializeJson(doc, configFile);
             if (!error) {
                 deviceId = doc["deviceId"].as<String>();
-                SerialMon.print("Loaded Device ID: ");
-                SerialMon.println(deviceId);
+                if (doc.containsKey("apn")) {
+                    apnConfig = doc["apn"].as<String>();
+                }
+                SerialMon.print("Loaded Config - ID: ");
+                SerialMon.print(deviceId);
+                SerialMon.print(", APN: ");
+                SerialMon.println(apnConfig);
             }
             configFile.close();
         }
@@ -180,6 +208,7 @@ void saveConfiguration() {
         if (configFile) {
             JsonDocument doc;
             doc["deviceId"] = deviceId;
+            doc["apn"] = apnConfig;
             serializeJson(doc, configFile);
             configFile.close();
             SerialMon.println("Configuration saved");
@@ -193,26 +222,42 @@ void setupAP() {
     WiFi.softAP(ap_ssid, ap_password);
     
     webServer.on("/", HTTP_GET, []() {
-        char temp[1500];
-        snprintf(temp, sizeof(temp), html_page, deviceId.c_str(), deviceId.c_str());
+        char temp[2000];
+        snprintf(temp, sizeof(temp), html_page, 
+                deviceId.c_str(), apnConfig.c_str(),
+                deviceId.c_str(), apnConfig.c_str());
         webServer.send(200, "text/html", temp);
     });
     
     webServer.on("/save", HTTP_POST, []() {
+        bool configChanged = false;
+        
         if (webServer.hasArg("deviceId")) {
             String newId = webServer.arg("deviceId");
             if (newId.startsWith("RailTemp") && newId.length() == 10) {
                 deviceId = newId;
-                saveConfiguration();
-                webServer.send(200, "text/html", 
-                    "<html><body><h2>Configuration Saved!</h2>"
-                    "<p>Device will restart...</p>"
-                    "<script>setTimeout(function(){ESP.restart();},2000);</script></body></html>");
-                delay(2000);
-                ESP.restart();
-            } else {
-                webServer.send(400, "text/html", "<h2>Error: Invalid ID format</h2>");
+                configChanged = true;
             }
+        }
+        
+        if (webServer.hasArg("apn")) {
+            String newApn = webServer.arg("apn");
+            if (newApn.length() > 0 && newApn.length() < 50) {
+                apnConfig = newApn;
+                configChanged = true;
+            }
+        }
+        
+        if (configChanged) {
+            saveConfiguration();
+            webServer.send(200, "text/html", 
+                "<html><body><h2>Configurazione Salvata!</h2>"
+                "<p>Il dispositivo si riavvierà...</p>"
+                "<script>setTimeout(function(){ESP.restart();},2000);</script></body></html>");
+            delay(2000);
+            ESP.restart();
+        } else {
+            webServer.send(400, "text/html", "<h2>Errore: Dati non validi</h2>");
         }
     });
     
@@ -303,8 +348,10 @@ bool initializeModem() {
         return false;
     }
     
-    // Configurazione APN
-    modem.sendAT("+CGDCONT=1,\"IP\",\"" + String(apn) + "\"");
+    // Configurazione APN dinamico
+    SerialMon.print("Setting APN: ");
+    SerialMon.println(apnConfig);
+    modem.sendAT("+CGDCONT=1,\"IP\",\"" + apnConfig + "\"");
     if (modem.waitResponse(10000L) != 1) {
         SerialMon.println("Failed to set APN");
         return false;
@@ -676,6 +723,29 @@ void logConnectionStats() {
     }
 }
 
+// Controllo modalità configurazione
+void checkConfigMode() {
+    // Se alimentato via USB e sensore non collegato, attiva modalità config
+    float voltage = readBatteryVoltage();
+    if (voltage == 0) {  // Alimentato via USB
+        SerialMon.println("USB Power detected - Starting configuration mode");
+        setupAP();
+        
+        // Loop per gestire le richieste web
+        while (true) {
+            webServer.handleClient();
+            delay(10);
+            
+            // Lampeggio LED per indicare modalità config
+            static unsigned long lastBlink = 0;
+            if (millis() - lastBlink > 500) {
+                lastBlink = millis();
+                digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+            }
+        }
+    }
+}
+
 // Setup principale
 void setup() {
     // Inizializzazione seriali
@@ -686,7 +756,14 @@ void setup() {
     delay(100);
     
     SerialMon.println("\n\n=== RailTemp Temperature Monitor ===");
-    SerialMon.println("Version: 2.0 - Temperature Only");
+    SerialMon.println("Version: 2.0 - Temperature Only Edition");
+    
+    // Configurazione pin
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(BATTERY_PIN, INPUT);
+    
+    // Controlla se entrare in modalità configurazione
+    checkConfigMode();
     
     // Carica configurazione
     loadConfiguration();
@@ -703,10 +780,6 @@ void setup() {
     // Disabilita WiFi per risparmio energetico
     WiFi.mode(WIFI_OFF);
     WiFi.disconnect(true);
-    
-    // Configurazione pin
-    pinMode(LED_PIN, OUTPUT);
-    pinMode(BATTERY_PIN, INPUT);
     
     // Reset contatore campioni
     sentSampleCount = 0;
