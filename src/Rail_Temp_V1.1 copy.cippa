@@ -85,46 +85,23 @@ const char* password = "123456789";
 // MQTT details
 const char* broker = "telemetry.tecnocons.com";
 
-// Topic variables that will be updated dynamically
-char topicTestLed[50];
-char topicStop[50];
-char topicStatus[50];
-char topicBatteryStatus[50];
-char topicGPSlat[50];
-char topicGPSlon[50];
-char topicGPSspeed[50];
-char topicAmpMotore[50];
-char topicWatt[50];
-char topicTemperature[50];
-char topicSignalLevel[50];
-char topicInit[50];
+const char* topicTestLed = "Railtemp03/TestLed";
+const char* topicStop = "Railtemp03/Stop";
+const char* topicStatus = "Railtemp03/Status";
+const char* topicInit = "GsmClientTest/init";
+const char* topicBatteryStatus = "Railtemp03/BatteryVoltage";
+const char* topicGPSlat = "Railtemp03/lat";
+const char* topicGPSlon = "Railtemp03/lon";
+const char* topicGPSspeed = "Railtemp03/speed";
+const char* topicAmpMotore = "Railtemp03/AmpMotore";
+const char* topicWatt = "Railtemp03/Watt";
+const char* topicTemperature = "Railtemp03/Temperature";
+const char* topicSignalLevel = "Railtemp03/SignalLevel";  // Aggiungi questa riga dopo gli altri topic
 
 // DeepSleep intervals
 uint64_t daySleepInterval = 600;  // 10 minuti in secondi
 uint64_t nightSleepInterval = 1800;  // 30 minuti in secondi
 
-// Connection Manager Structure
-struct ConnectionManager {
-    int attemptCount = 0;
-    unsigned long lastAttemptTime = 0;
-    unsigned long totalConnectionTime = 0;
-    const unsigned long MAX_TOTAL_TIME = 600000;  // 10 minuti max totale
-    const int MAX_ATTEMPTS = 8;  // Max 8 tentativi
-    
-    // Array di delay progressivi in secondi
-    const int delayTable[8] = {5, 10, 20, 30, 60, 120, 180, 300};
-    
-    unsigned long getNextDelay() {
-        if (attemptCount >= MAX_ATTEMPTS) return 0;
-        return delayTable[min(attemptCount, 7)] * 1000UL;
-    }
-    
-    void reset() {
-        attemptCount = 0;
-        lastAttemptTime = 0;
-        totalConnectionTime = 0;
-    }
-} connManager;
 
 TimeTrigger timerAccel;
 Timer timerButton;
@@ -185,14 +162,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int len);
 void disableGPS();
 void SendDataToTraccar(float lat, float lon);
 void goToDeepSleep(uint64_t time_in_seconds);
-bool initializeModem();
-bool connectToNetwork();
-bool connectToGPRS();
-void logConnectionStats();
 
 float readBatteryVoltage();
-
-int sentSampleCount = 0; // Variabile globale per contare i campioni inviati
 
 void IRAM_ATTR onPulse() {
   pulseCount++;
@@ -285,6 +256,7 @@ void setupAP() {
     SerialMon.println("AP Web Server started");
 }
 
+
 float readBatteryVoltage() {
     int analogValue = analogRead(BATTERY_PIN);
     float voltage = analogValue * (3.3 / 4095.0);  // 3.3V è la tensione di riferimento e 4095 è il valore massimo dell'ADC a 12 bit
@@ -338,203 +310,34 @@ void modemRestart() {
   modemPowerOn();
 }
 
-// Funzione helper per inizializzare il modem
-bool initializeModem() {
-    SerialMon.println("Initializing modem...");
-    
-    // Test AT base con retry
-    for (int i = 0; i < 3; i++) {
-        if (modem.testAT()) {
-            SerialMon.println("Modem responding");
-            break;
-        }
-        if (i == 2) {
-            SerialMon.println("Modem not responding - restarting");
-            modemRestart();
-            delay(5000);
-            return false;
-        }
-        delay(1000);
-    }
-    
-    // Inizializzazione con timeout lungo per operatori lenti
-    modem.sendAT("+CFUN=0");  // Modalità minima
-    modem.waitResponse(10000L);
-    delay(3000);
-    
-    modem.sendAT("+CFUN=1");  // Full functionality
-    if (modem.waitResponse(30000L) != 1) {
-        SerialMon.println("Failed to set full functionality");
-        return false;
-    }
-    
-    // Configurazione APN con delay per propagazione
-    modem.sendAT("+CGDCONT=1,\"IP\",\"" + String(apn) + "\"");
-    if (modem.waitResponse(10000L) != 1) {
-        SerialMon.println("Failed to set APN");
-        return false;
-    }
-    delay(2000);  // Delay per propagazione configurazione
-    
-    // Configurazione modalità rete ottimizzata per stabilità
-    modem.sendAT("+CNMP=38");  // LTE only per stabilità
-    modem.waitResponse(5000L);
-    
-    modem.sendAT("+CMNB=1");   // CAT-M only
-    modem.waitResponse(5000L);
-    
-    return true;
-}
-
-// Funzione per connessione alla rete con timeout dinamici
-bool connectToNetwork() {
-    SerialMon.println("Connecting to network...");
-    
-    // Timeout basato sul numero di tentativi
-    int baseTimeout = 30;  // 30 secondi base
-    int additionalTimeout = connManager.attemptCount * 10;  // +10s per tentativo
-    int maxWaitTime = baseTimeout + additionalTimeout;
-    
-    SerialMon.printf("Network timeout: %d seconds\n", maxWaitTime);
-    
-    // Forza ricerca rete se non al primo tentativo
-    if (connManager.attemptCount > 1) {
-        modem.sendAT("+COPS=0");  // Automatic operator selection
-        modem.waitResponse(60000L);
-        delay(5000);
-    }
-    
-    // Attendi connessione alla rete
-    unsigned long startTime = millis();
-    while (millis() - startTime < (maxWaitTime * 1000UL)) {
-        if (modem.isNetworkConnected()) {
-            // Verifica qualità segnale
-            int signal = modem.getSignalQuality();
-            SerialMon.printf("Network connected! Signal: %d\n", signal);
-            
-            // Se segnale troppo debole, attendi che migliori
-            if (signal < 10 && signal != 99) {
-                SerialMon.println("Weak signal, waiting for improvement...");
-                delay(10000);
-                continue;
-            }
-            
-            // Ottieni info operatore
-            String cop = modem.getOperator();
-            SerialMon.println("Operator: " + cop);
-            
-            return true;
-        }
-        
-        // Status check ogni 5 secondi
-        if ((millis() - startTime) % 5000 < 100) {
-            int signal = modem.getSignalQuality();
-            SerialMon.printf("Waiting... Signal: %d, Time: %lds/%ds\n", 
-                           signal, 
-                           (millis() - startTime) / 1000,
-                           maxWaitTime);
-        }
-        
-        delay(1000);
-        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-    }
-    
-    return false;
-}
-
-// Funzione per connessione GPRS con gestione errori migliorata
-bool connectToGPRS() {
-    SerialMon.println("Connecting to GPRS...");
-    
-    // Chiudi eventuali connessioni precedenti
-    modem.sendAT("+CIPSHUT");
-    modem.waitResponse(20000L);
-    delay(2000);
-    
-    // Detach e re-attach per pulizia
-    if (connManager.attemptCount > 1) {
-        SerialMon.println("Performing GPRS detach/attach cycle...");
-        modem.sendAT("+CGATT=0");
-        modem.waitResponse(30000L);
-        delay(5000);
-    }
-    
-    // Attach GPRS con timeout lungo
-    modem.sendAT("+CGATT=1");
-    if (modem.waitResponse(120000L) != 1) {  // 2 minuti per attach
-        SerialMon.println("GPRS attach failed");
-        return false;
-    }
-    
-    // Attiva contesto PDP con retry
-    for (int retry = 0; retry < 3; retry++) {
-        SerialMon.printf("Activating PDP context (attempt %d/3)...\n", retry + 1);
-        
-        modem.sendAT("+CGACT=1,1");
-        int response = modem.waitResponse(150000L);  // 2.5 minuti
-        
-        if (response == 1) {
-            SerialMon.println("PDP context activated");
-            break;
-        }
-        
-        if (retry == 2) {
-            SerialMon.println("Failed to activate PDP context");
-            return false;
-        }
-        
-        delay(10000);  // 10 secondi tra tentativi
-    }
-    
-    // Verifica connessione GPRS
-    delay(5000);  // Delay per stabilizzazione
-    
-    if (!modem.isGprsConnected()) {
-        SerialMon.println("GPRS not connected after activation");
-        return false;
-    }
-    
-    // Ottieni IP
-    String ip = modem.getLocalIP();
-    SerialMon.println("GPRS Connected! IP: " + ip);
-    
-    return true;
-}
-
-// Modifica della funzione mqttConnect per usare l'ID dinamico
+// Modificare la funzione mqttConnect per usare l'ID dinamico
 boolean mqttConnect() {
-    SerialMon.print("Connecting to MQTT broker...");
+    SerialMon.print("Connecting to ");
+    SerialMon.print(broker);
     
-    // Timeout progressivo anche per MQTT
-    mqtt.setKeepAlive(120);  // 2 minuti keepalive
-    mqtt.setSocketTimeout(30);  // 30 secondi socket timeout
+    // Usa deviceId invece dell'ID hardcoded
+    boolean status = mqtt.connect(deviceId.c_str(), "tecnocons", "nonserve");
     
-    // Tentativi con backoff
-    for (int i = 0; i < 3; i++) {
-        if (mqtt.connect(deviceId.c_str(), "tecnocons", "nonserve")) {
-            SerialMon.println(" success");
-            
-            // Subscribe con retry
-            String testLedTopic = deviceId + "/TestLed";
-            String stopTopic = deviceId + "/Stop";
-            
-            if (mqtt.subscribe(testLedTopic.c_str()) && 
-                mqtt.subscribe(stopTopic.c_str())) {
-                
-                // Pubblica messaggio di init
-                String initTopic = deviceId + "/init";
-                mqtt.publish(initTopic.c_str(), "Device started");
-                
-                return true;
-            }
-        }
-        
-        SerialMon.printf(" fail (attempt %d/3)\n", i + 1);
-        delay(5000 * (i + 1));  // Delay progressivo
+    if (status == false) {
+        SerialMon.println(" fail");
+        return false;
     }
+    SerialMon.println(" success");
+
+    // Pubblica il messaggio di init con il nuovo ID
+    String initTopic = deviceId + "/init";
+    mqtt.publish(initTopic.c_str(), "Device started");
+
+    // Sottoscrizione ai topic con il nuovo ID
+    String testLedTopic = deviceId + "/TestLed";
+    String stopTopic = deviceId + "/Stop";
     
-    return false;
+    mqtt.subscribe(testLedTopic.c_str());
+    mqtt.subscribe(stopTopic.c_str());
+
+    return mqtt.connected();
 }
+
 
 void SendDataToTraccar(float lat, float lon) {
     String latStr = String(lat, 6);
@@ -557,8 +360,22 @@ void SendDataToTraccar(float lat, float lon) {
     http.stop();
 }
 
+
+
 // Modificare le definizioni dei topic MQTT per usare l'ID variabile
 void updateMqttTopics() {
+    // Buffer per costruire i topic
+    static char topicTestLed[50];
+    static char topicStop[50];
+    static char topicStatus[50];
+    static char topicBatteryStatus[50];
+    static char topicGPSlat[50];
+    static char topicGPSlon[50];
+    static char topicGPSspeed[50];
+    static char topicAmpMotore[50];
+    static char topicWatt[50];
+    static char topicTemperature[50];
+
     // Costruzione dei topic con l'ID corrente
     snprintf(topicTestLed, sizeof(topicTestLed), "%s/TestLed", deviceId.c_str());
     snprintf(topicStop, sizeof(topicStop), "%s/Stop", deviceId.c_str());
@@ -570,95 +387,11 @@ void updateMqttTopics() {
     snprintf(topicAmpMotore, sizeof(topicAmpMotore), "%s/AmpMotore", deviceId.c_str());
     snprintf(topicWatt, sizeof(topicWatt), "%s/Watt", deviceId.c_str());
     snprintf(topicTemperature, sizeof(topicTemperature), "%s/Temperature", deviceId.c_str());
-    snprintf(topicSignalLevel, sizeof(topicSignalLevel), "%s/SignalLevel", deviceId.c_str());
-    snprintf(topicInit, sizeof(topicInit), "%s/init", deviceId.c_str());
 }
 
-void ConnectTask() {
-    // Se già connessi, verifica solo lo stato
-    if (connectionOK && modem.isGprsConnected()) {
-        SignalQuality = modem.getSignalQuality();
-        Connected = modem.isNetworkConnected() && modem.isGprsConnected();
-        
-        if (!Connected) {
-            SerialMon.println("Connection lost - Will reconnect");
-            connectionOK = false;
-            connManager.reset();  // Reset per nuova sequenza
-        }
-        return;
-    }
-    
-    // Controllo tempo totale di connessione
-    if (connManager.totalConnectionTime == 0) {
-        connManager.totalConnectionTime = millis();
-    }
-    
-    if (millis() - connManager.totalConnectionTime > connManager.MAX_TOTAL_TIME) {
-        SerialMon.println("Total connection time exceeded - going to deep sleep");
-        goToDeepSleep(TIME_TO_SLEEP_LONG);
-        return;
-    }
-    
-    // Controllo delay progressivo
-    unsigned long currentTime = millis();
-    unsigned long nextDelay = connManager.getNextDelay();
-    
-    if (connManager.attemptCount > 0 && 
-        (currentTime - connManager.lastAttemptTime) < nextDelay) {
-        // Ancora in attesa del prossimo tentativo
-        return;
-    }
-    
-    // Controllo numero massimo tentativi
-    if (connManager.attemptCount >= connManager.MAX_ATTEMPTS) {
-        SerialMon.println("Max attempts reached - going to deep sleep");
-        goToDeepSleep(TIME_TO_SLEEP_LONG);
-        return;
-    }
-    
-    // Inizia nuovo tentativo
-    SerialMon.printf("\n=== Connection Attempt %d/%d ===\n", 
-                     connManager.attemptCount + 1, connManager.MAX_ATTEMPTS);
-    SerialMon.printf("Waiting %d seconds before attempt...\n", 
-                     nextDelay / 1000);
-    
-    connManager.lastAttemptTime = currentTime;
-    connManager.attemptCount++;
-    
-    // Controlla batteria prima di procedere
-    float battVoltage = readBatteryVoltage();
-    if (battVoltage < 3.6 && battVoltage > 0) {
-        SerialMon.println("Battery too low for connection attempt");
-        goToDeepSleep(TIME_TO_SLEEP_LONG);
-        return;
-    }
-    
-    // Sequenza di inizializzazione modem con timeout appropriati
-    if (!initializeModem()) {
-        SerialMon.println("Modem initialization failed");
-        return;
-    }
-    
-    // Connessione alla rete con timeout progressivi
-    if (!connectToNetwork()) {
-        SerialMon.println("Network connection failed");
-        return;
-    }
-    
-    // Connessione GPRS con gestione errori
-    if (!connectToGPRS()) {
-        SerialMon.println("GPRS connection failed");
-        return;
-    }
-    
-    // Se arriviamo qui, connessione riuscita
-    SerialMon.println("*** CONNECTION SUCCESSFUL! ***");
-    connectionOK = true;
-    connManager.reset();  // Reset per prossima volta
-    
-    // Connetti MQTT
-    mqttConnect();
-}
+
+int sentSampleCount = 0; // Variabile globale per contare i campioni inviati
+
 
 void SendMqttDataTask() {
   batteryVoltage = readBatteryVoltage();
@@ -671,6 +404,7 @@ void SendMqttDataTask() {
       goToDeepSleep(TIME_TO_SLEEP_LONG);
   }
 
+
   if (connectionOK == true) {
     static unsigned long memMillisGPS = 0;
     int year, month, day, hour, minute, second;
@@ -682,6 +416,7 @@ void SendMqttDataTask() {
     static char charSpeed[10];
     static char charCoord[20];
     static bool GPSdataAvailable;
+
 
     // Aggiungi il controllo del livello del segnale
     static unsigned long lastSignalCheck = 0;
@@ -729,30 +464,29 @@ void SendMqttDataTask() {
       }
     }
 
-    if (!mqtt.connected()) {
-        uint32_t t = millis();
-        if (t - lastReconnectAttempt > 10000L) {
-            SerialMon.println("=== MQTT NOT CONNECTED ===");
-            lastReconnectAttempt = t;
-            
-            // Verifica prima lo stato della connessione GPRS
-            if (!modem.isGprsConnected()) {
-                SerialMon.println("GPRS connection lost - Resetting connection...");
-                connectionOK = false;  // Forza riconnessione in ConnectTask
-                connManager.reset();
-                return;
-            }
-            
-            if (mqttConnect()) {
-                lastReconnectAttempt = 0;
-                SerialMon.println("MQTT reconnected successfully");
-            } else {
-                SerialMon.println("MQTT reconnection failed");
-            }
+if (!mqtt.connected()) {
+    uint32_t t = millis();
+    if (t - lastReconnectAttempt > 10000L) {
+        SerialMon.println("=== MQTT NOT CONNECTED ===");
+        lastReconnectAttempt = t;
+        
+        // Verifica prima lo stato della connessione GPRS
+        if (!modem.isGprsConnected()) {
+            SerialMon.println("GPRS connection lost - Resetting connection...");
+            connectionOK = false;  // Forza riconnessione in ConnectTask
+            return;
         }
-        delay(100);
-        return;
+        
+        if (mqttConnect()) {
+            lastReconnectAttempt = 0;
+            SerialMon.println("MQTT reconnected successfully");
+        } else {
+            SerialMon.println("MQTT reconnection failed");
+        }
     }
+    delay(100);
+    return;
+}
     else {  //se mqtt connesso
       mqtt.loop();
       //Send voltage over MQTT
@@ -863,6 +597,98 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
 void disableGPS() {
   modem.sendAT("+SGPIO=0,4,1,0");
   modem.disableGPS();
+}
+
+void ConnectTask() {
+    if (!connectionOK || !modem.isGprsConnected()) {  // Aggiungiamo il controllo GPRS
+        String res;
+        
+        // Verifica lo stato del modem
+        if (!modem.testAT()) {
+            SerialMon.println("Modem not responding - Restarting...");
+            modemRestart();
+            delay(2000);
+            return;
+        }
+
+        // Se il modem risponde ma non siamo connessi, proviamo a reinizializzare
+        if (!modem.init()) {
+            SerialMon.println("Modem init failed - Restarting...");
+            modemRestart();
+            delay(2000);
+            return;
+        }
+
+        SerialMon.println("Setting network mode...");
+        modem.setNetworkMode(13);    // Force LTE only
+        modem.setPreferredMode(1);
+        delay(500);
+
+        // Verifica la connessione alla rete
+        for (int i = 0; i < 5; i++) {
+            SerialMon.println("Checking network connection...");
+            bool isConnected = false;
+            int tryCount = 30;  // Ridotto da 60 a 30 per una risposta più rapida
+            
+            while (tryCount-- && !isConnected) {
+                int16_t signal = modem.getSignalQuality();
+                SerialMon.printf("Signal quality: %d\n", signal);
+                
+                isConnected = modem.isNetworkConnected();
+                if (isConnected) {
+                    SerialMon.println("Network connected!");
+                    break;
+                }
+                delay(1000);
+                digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+            }
+            
+            if (isConnected) break;
+            
+            if (i < 4) {  // Non attendere dopo l'ultimo tentativo
+                SerialMon.println("Network connection failed, retrying...");
+                delay(3000);
+            }
+        }
+
+        digitalWrite(LED_PIN, HIGH);
+
+        // Verifica stato rete
+        modem.sendAT("+CPSI?");
+        if (modem.waitResponse(1000L, res) == 1) {
+            SerialMon.println("Network status: " + res);
+        }
+
+        // Connessione GPRS
+        SerialMon.println("Connecting to GPRS...");
+        if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+            SerialMon.println("GPRS connection failed");
+            delay(10000);
+            return;
+        }
+        
+        SerialMon.println("GPRS connected!");
+        connectionOK = true;
+    }
+
+    // Aggiorna lo stato della connessione
+    SignalQuality = modem.getSignalQuality();
+    Connected = modem.isNetworkConnected() && modem.isGprsConnected();
+    
+    // Se perdiamo la connessione, forza una riconnessione al prossimo ciclo
+    if (!Connected) {
+        SerialMon.println("Connection lost - Will reconnect on next cycle");
+        connectionOK = false;
+    } else {
+        // Stampa periodicamente lo stato della connessione
+        static unsigned long lastStatusPrint = 0;
+        if (millis() - lastStatusPrint > 30000) {  // Ogni 30 secondi
+            lastStatusPrint = millis();
+            SerialMon.printf("Signal Quality: %d, GPRS Connected: %s\n", 
+                           SignalQuality, 
+                           modem.isGprsConnected() ? "YES" : "NO");
+        }
+    }
 }
 
 struct SeasonTime {
@@ -990,29 +816,8 @@ void goToDeepSleep(uint64_t time_in_seconds) {
     esp_deep_sleep_start();
 }
 
-// Aggiungi questa funzione per monitoraggio diagnostico
-void logConnectionStats() {
-    static unsigned long lastLog = 0;
-    
-    if (millis() - lastLog > 60000) {  // Log ogni minuto
-        lastLog = millis();
-        
-        SerialMon.println("\n=== Connection Statistics ===");
-        SerialMon.printf("Connection OK: %s\n", connectionOK ? "YES" : "NO");
-        SerialMon.printf("Signal Quality: %d\n", modem.getSignalQuality());
-        SerialMon.printf("Network Connected: %s\n", 
-                       modem.isNetworkConnected() ? "YES" : "NO");
-        SerialMon.printf("GPRS Connected: %s\n", 
-                       modem.isGprsConnected() ? "YES" : "NO");
-        SerialMon.printf("MQTT Connected: %s\n", 
-                       mqtt.connected() ? "YES" : "NO");
-        SerialMon.printf("Connection Attempts: %d\n", connManager.attemptCount);
-        SerialMon.printf("Battery Voltage: %.2fV\n", readBatteryVoltage());
-        SerialMon.println("==========================\n");
-    }
-}
-
 void setup() {
+
     // Pin alla stato Hi-Z (alta impedenza)
     pinMode(18, INPUT);
     pinMode(19, INPUT);
@@ -1025,132 +830,136 @@ void setup() {
     SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
     delay(100);
     
-    OPENLOG_SERIAL.begin(9600, SERIAL_8N1, OPENLOG_RX, OPENLOG_TX);
-    delay(1000);
-    
-    loadConfiguration();  // Carica l'ID del dispositivo
-    updateMqttTopics();  // Aggiorna i topic MQTT con il nuovo ID
+    // Resto del codice...
+  SerialMon.begin(115200);
+  OPENLOG_SERIAL.begin(9600, SERIAL_8N1, OPENLOG_RX, OPENLOG_TX);
+  delay(1000);
+  
+  loadConfiguration();  // Carica l'ID del dispositivo
+  updateMqttTopics();  // Aggiorna i topic MQTT con il nuovo ID
 
-    sensors.begin();  // Inizializza il sensore DS18B20
 
-    WiFi.mode(WIFI_OFF);
-    WiFi.disconnect(true);
+  sensors.begin();  // Inizializza il sensore DS18B20
 
-    pinMode(BATTERY_PIN, INPUT); // Pin per la lettura della batteria
+  WiFi.mode(WIFI_OFF);
+  WiFi.disconnect(true);
 
-    // Resetta il contatore dei campioni al risveglio
-    sentSampleCount = 0;
+  pinMode(BATTERY_PIN, INPUT); // Pin per la lettura della batteria
 
-    // Initialize accelerometer
-    ADXL_Present = true;
-    if (!accel.begin()) {
-        SerialMon.println("No ADXL345 detected");
-        ADXL_Present = false;
-    }
-    if (ADXL_Present) accel.setRange(ADXL345_RANGE_16_G);
+  // Resetta il contatore dei campioni al risveglio
+  sentSampleCount = 0;
 
-    // Setup interrupt for speed sensor
-    attachInterrupt(digitalPinToInterrupt(26), onPulse, RISING);
+  // Initialize accelerometer
+  ADXL_Present = true;
+  if (!accel.begin()) {
+    SerialMon.println("No ADXL345 detected");
+    ADXL_Present = false;
+  }
+  if (ADXL_Present) accel.setRange(ADXL345_RANGE_16_G);
 
-    // Initialize modem and MQTT
-    modemPowerOn();
-    SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
-    enableGPS();
-    mqtt.setServer(broker, 1883);
-    mqtt.setCallback(mqttCallback);
+  // Setup interrupt for speed sensor
+  attachInterrupt(digitalPinToInterrupt(26), onPulse, RISING);
 
-    // Task for testing
-    xTaskCreatePinnedToCore(
-        [] (void*) {
-        for (;;) {
-            vTaskDelay(10000 / portTICK_PERIOD_MS);
-        }
-        },
-        "Task3",
-        1000,
-        NULL,
-        0,
-        &Task3,
-        0
-    );
+  // Initialize modem and MQTT
+  modemPowerOn();
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+  enableGPS();
+  mqtt.setServer(broker, 1883);
+  mqtt.setCallback(mqttCallback);
+
+  // Task for testing
+  xTaskCreatePinnedToCore(
+    [] (void*) {
+      for (;;) {
+        vTaskDelay(10000 / portTICK_PERIOD_MS);
+      }
+    },
+    "Task3",
+    1000,
+    NULL,
+    0,
+    &Task3,
+    0
+  );
 }
 
 void loop() {
-    ConnectTask();
-    SendMqttDataTask();
-    logConnectionStats();
-    
-    #define SAMPLE_INTERVAL_MS 30000
+  ConnectTask();
+  SendMqttDataTask();
+#define SAMPLE_INTERVAL_MS 30000
 
-    if (ADXL_Present) {
-        static unsigned long lastSampleTime = 0;
-        static unsigned long lastAverageTime = 0;
-        float sumX = 0.0;
-        float sumY = 0.0;
-        float sumZ = 0.0;
-        unsigned int sampleCount = 0;
+  if (ADXL_Present) {
 
-        // Reading accelerometer data at high frequency
-        if (millis() - lastSampleTime >= SAMPLE_INTERVAL_MS) {
-            lastSampleTime = millis();
+  
+    static unsigned long lastSampleTime = 0;
+    static unsigned long lastAverageTime = 0;
+    float sumX = 0.0;
+    float sumY = 0.0;
+    float sumZ = 0.0;
+    unsigned int sampleCount = 0;
 
-            if (ADXL_Present) {
-                sensors_event_t event;
-                accel.getEvent(&event);
-                float accelX = event.acceleration.x;
-                float accelY = event.acceleration.y;
-                float accelZ = event.acceleration.z;
+    // Reading accelerometer data at high frequency
+    if (millis() - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+      lastSampleTime = millis();
 
-                sumX += accelX;
-                sumY += accelY;
-                sumZ += accelZ;
+      if (ADXL_Present) {
+        sensors_event_t event;
+        accel.getEvent(&event);
+        float accelX = event.acceleration.x;
+        float accelY = event.acceleration.y;
+        float accelZ = event.acceleration.z;
 
-                sampleCount++;
-            }
-        }
+        sumX += accelX;
+        sumY += accelY;
+        sumZ += accelZ;
 
-        #define AVERAGE_INTERVAL_MS 1000
-        
-        // Calculate average values every second
-        if (millis() - lastAverageTime >= AVERAGE_INTERVAL_MS) {
-            lastAverageTime = millis();
-        
-            float avgX = sumX / sampleCount;
-            float avgY = sumY / sampleCount;
-            float avgZ = sumZ / sampleCount;
-        
-            sumX = 0;
-            sumY = 0;
-            sumZ = 0;
-            sampleCount = 0;
-        
-            float minX = 1000;
-            float minY = 1000;
-            float minZ = 1000;
-            float maxX = -1000;
-            float maxY = -1000;
-            float maxZ = -1000;
-        
-            static unsigned long lastTime = 0;
-            if (millis() - lastTime >= 1000) {
-                lastTime = millis();
-        
-                float speed = calculateSpeed();
-                int pressure1 = analogRead(analogPin1);
-                int pressure2 = analogRead(analogPin2);
-                int pressure3 = analogRead(analogPin3);
-        
-                String dataString = String(millis()) + ";" + String(speed) + ";" + String(pressure1) + ";" + String(pressure2) + ";" + String(pressure3) + ";" + String(avgX) + ";" + String(avgY) + ";" + String(avgZ) + ";" + String(minX) + ";" + String(minY) + ";" + String(minZ) + ";" + String(maxX) + ";" + String(maxY) + ";" + String(maxZ);
-                OPENLOG_SERIAL.println(dataString);
-                SerialMon.println(dataString);
-        
-                minX = 1000;
-                minY = 1000;
-                minZ = 1000;
-                maxX = -1000;
-                maxY = -1000;
-                maxZ = -1000;
-            }
-        }
+        sampleCount++;
+      }
     }
+
+    #define AVERAGE_INTERVAL_MS 1000
+    
+    // Calculate average values every second
+    if (millis() - lastAverageTime >= AVERAGE_INTERVAL_MS) {
+      lastAverageTime = millis();
+    
+      float avgX = sumX / sampleCount;
+      float avgY = sumY / sampleCount;
+      float avgZ = sumZ / sampleCount;
+    
+      sumX = 0;
+      sumY = 0;
+      sumZ = 0;
+      sampleCount = 0;
+    
+      float minX = 1000;
+      float minY = 1000;
+      float minZ = 1000;
+      float maxX = -1000;
+      float maxY = -1000;
+      float maxZ = -1000;
+    
+      static unsigned long lastTime = 0;
+      if (millis() - lastTime >= 1000) {
+        lastTime = millis();
+    
+        float speed = calculateSpeed();
+        int pressure1 = analogRead(analogPin1);
+        int pressure2 = analogRead(analogPin2);
+        int pressure3 = analogRead(analogPin3);
+    
+        String dataString = String(millis()) + ";" + String(speed) + ";" + String(pressure1) + ";" + String(pressure2) + ";" + String(pressure3) + ";" + String(avgX) + ";" + String(avgY) + ";" + String(avgZ) + ";" + String(minX) + ";" + String(minY) + ";" + String(minZ) + ";" + String(maxX) + ";" + String(maxY) + ";" + String(maxZ);
+        OPENLOG_SERIAL.println(dataString);
+        SerialMon.println(dataString);
+    
+        minX = 1000;
+        minY = 1000;
+        minZ = 1000;
+        maxX = -1000;
+        maxY = -1000;
+        maxZ = -1000;
+      }
+    }
+    }
+  
 }
