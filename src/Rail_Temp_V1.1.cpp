@@ -3,7 +3,11 @@
 #include <WiFi.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <EEPROM.h>
+
+// ===== CONFIGURAZIONE DISPOSITIVO - MODIFICARE SOLO QUESTE DUE RIGHE =====
+const char* DEVICE_ID = "RailTemp02";              // ID del dispositivo
+const char* APN = "shared.tids.tim.it";            // APN dell'operatore
+// ========================================================================
 
 // Configurazione pin sensore temperatura
 #define ONE_WIRE_BUS 18
@@ -40,21 +44,6 @@ DallasTemperature sensors(&oneWire);
 
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
-
-// Provisioning Device ID
-#include <WebServer.h>
-#include <SPIFFS.h>
-#include <ArduinoJson.h>
-
-// Web Server per configurazione
-WebServer webServer(80);
-const char* ap_ssid = "RailTemp-Setup";
-const char* ap_password = "12345678";
-const char* config_file = "/config.json";
-
-// Configurazioni modificabili
-String deviceId = "RailTemp00";
-String apnConfig = "wsim";  // APN configurabile "wsim per (APN Wherever) shared.tids.tim.it"(APN TIM)
 
 // Credenziali GPRS (solitamente vuote)
 const char gprsUser[] = "";
@@ -112,9 +101,6 @@ void enableGPS();
 void disableGPS();
 float readBatteryVoltage();
 void goToDeepSleep(uint64_t time_in_seconds);
-void loadConfiguration();
-void saveConfiguration();
-void setupAP();
 void updateMqttTopics();
 bool initializeModem();
 bool connectToNetwork();
@@ -125,156 +111,16 @@ boolean mqttConnect();
 void mqttCallback(char* topic, byte* payload, unsigned int len);
 void logConnectionStats();
 
-// Pagina HTML per configurazione
-const char* html_page = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-    <title>RailTemp Setup</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body { font-family: Arial; margin: 20px; }
-        .container { max-width: 400px; margin: 0 auto; }
-        input, button { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; }
-        button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
-        button:hover { background-color: #45a049; }
-        .status { margin-top: 20px; padding: 10px; background: #f0f0f0; border-radius: 5px; }
-        .info { margin: 20px 0; padding: 15px; background: #e7f3ff; border-radius: 5px; }
-        label { font-weight: bold; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>RailTemp Setup</h1>
-        <div class="info">
-            <strong>Modalità Configurazione</strong><br>
-            Configura ID dispositivo e APN operatore
-        </div>
-        <form action="/save" method="POST">
-            <label>Device ID:</label>
-            <input type="text" name="deviceId" value="%s" pattern="RailTemp[0-9]{2}" 
-                   title="Format: RailTempXX (XX sono numeri)" required>
-            
-            <label>APN Operatore:</label>
-            <input type="text" name="apn" value="%s" 
-                   placeholder="es: ibox.tim.it" required>
-            
-            <button type="submit">Salva Configurazione</button>
-        </form>
-        <div class="status">
-            <strong>Configurazione Attuale:</strong><br>
-            ID: %s<br>
-            APN: %s<br>
-            <hr>
-            <small>
-            APN comuni:<br>
-            • TIM: shared.tids.tim.it<br>
-            • Vodafone: web.omnitel.it<br>
-            • WindTre: internet.it<br>
-            • Iliad: iliad
-            </small>
-        </div>
-    </div>
-</body>
-</html>
-)rawliteral";
-
-// Carica configurazione da SPIFFS
-void loadConfiguration() {
-    if (SPIFFS.begin(true)) {
-        File configFile = SPIFFS.open(config_file, "r");
-        if (configFile) {
-            JsonDocument doc;
-            DeserializationError error = deserializeJson(doc, configFile);
-            if (!error) {
-                deviceId = doc["deviceId"].as<String>();
-                if (doc.containsKey("apn")) {
-                    apnConfig = doc["apn"].as<String>();
-                }
-                SerialMon.print("Loaded Config - ID: ");
-                SerialMon.print(deviceId);
-                SerialMon.print(", APN: ");
-                SerialMon.println(apnConfig);
-            }
-            configFile.close();
-        }
-    }
-}
-
-// Salva configurazione su SPIFFS
-void saveConfiguration() {
-    if (SPIFFS.begin(true)) {
-        File configFile = SPIFFS.open(config_file, "w");
-        if (configFile) {
-            JsonDocument doc;
-            doc["deviceId"] = deviceId;
-            doc["apn"] = apnConfig;
-            serializeJson(doc, configFile);
-            configFile.close();
-            SerialMon.println("Configuration saved");
-        }
-    }
-}
-
-// Setup Access Point per configurazione
-void setupAP() {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(ap_ssid, ap_password);
-    
-    webServer.on("/", HTTP_GET, []() {
-        char temp[2000];
-        snprintf(temp, sizeof(temp), html_page, 
-                deviceId.c_str(), apnConfig.c_str(),
-                deviceId.c_str(), apnConfig.c_str());
-        webServer.send(200, "text/html", temp);
-    });
-    
-    webServer.on("/save", HTTP_POST, []() {
-        bool configChanged = false;
-        
-        if (webServer.hasArg("deviceId")) {
-            String newId = webServer.arg("deviceId");
-            if (newId.startsWith("RailTemp") && newId.length() == 10) {
-                deviceId = newId;
-                configChanged = true;
-            }
-        }
-        
-        if (webServer.hasArg("apn")) {
-            String newApn = webServer.arg("apn");
-            if (newApn.length() > 0 && newApn.length() < 50) {
-                apnConfig = newApn;
-                configChanged = true;
-            }
-        }
-        
-        if (configChanged) {
-            saveConfiguration();
-            webServer.send(200, "text/html", 
-                "<html><body><h2>Configurazione Salvata!</h2>"
-                "<p>Il dispositivo si riavvierà...</p>"
-                "<script>setTimeout(function(){ESP.restart();},2000);</script></body></html>");
-            delay(2000);
-            ESP.restart();
-        } else {
-            webServer.send(400, "text/html", "<h2>Errore: Dati non validi</h2>");
-        }
-    });
-    
-    webServer.begin();
-    SerialMon.println("Configuration server started at 192.168.4.1");
-}
-
 // Aggiorna i topic MQTT con l'ID del dispositivo
 void updateMqttTopics() {
-    snprintf(topicTemperature, sizeof(topicTemperature), "%s/Temperature", deviceId.c_str());
-    snprintf(topicBatteryStatus, sizeof(topicBatteryStatus), "%s/BatteryVoltage", deviceId.c_str());
-    snprintf(topicGPSlat, sizeof(topicGPSlat), "%s/lat", deviceId.c_str());
-    snprintf(topicGPSlon, sizeof(topicGPSlon), "%s/lon", deviceId.c_str());
-    snprintf(topicSignalLevel, sizeof(topicSignalLevel), "%s/SignalLevel", deviceId.c_str());
-    snprintf(topicStatus, sizeof(topicStatus), "%s/Status", deviceId.c_str());
-    snprintf(topicTestLed, sizeof(topicTestLed), "%s/TestLed", deviceId.c_str());
-    snprintf(topicInit, sizeof(topicInit), "%s/init", deviceId.c_str());
+    snprintf(topicTemperature, sizeof(topicTemperature), "%s/Temperature", DEVICE_ID);
+    snprintf(topicBatteryStatus, sizeof(topicBatteryStatus), "%s/BatteryVoltage", DEVICE_ID);
+    snprintf(topicGPSlat, sizeof(topicGPSlat), "%s/lat", DEVICE_ID);
+    snprintf(topicGPSlon, sizeof(topicGPSlon), "%s/lon", DEVICE_ID);
+    snprintf(topicSignalLevel, sizeof(topicSignalLevel), "%s/SignalLevel", DEVICE_ID);
+    snprintf(topicStatus, sizeof(topicStatus), "%s/Status", DEVICE_ID);
+    snprintf(topicTestLed, sizeof(topicTestLed), "%s/TestLed", DEVICE_ID);
+    snprintf(topicInit, sizeof(topicInit), "%s/init", DEVICE_ID);
 }
 
 // Legge tensione batteria
@@ -348,10 +194,10 @@ bool initializeModem() {
         return false;
     }
     
-    // Configurazione APN dinamico
+    // Configurazione APN
     SerialMon.print("Setting APN: ");
-    SerialMon.println(apnConfig);
-    modem.sendAT("+CGDCONT=1,\"IP\",\"" + apnConfig + "\"");
+    SerialMon.println(APN);
+    modem.sendAT("+CGDCONT=1,\"IP\",\"" + String(APN) + "\"");
     if (modem.waitResponse(10000L) != 1) {
         SerialMon.println("Failed to set APN");
         return false;
@@ -500,6 +346,7 @@ void ConnectTask() {
     
     SerialMon.printf("\n=== Connection Attempt %d/%d ===\n", 
                      connManager.attemptCount + 1, connManager.MAX_ATTEMPTS);
+    SerialMon.printf("Next delay: %lu seconds\n", nextDelay / 1000);
     
     connManager.lastAttemptTime = currentTime;
     connManager.attemptCount++;
@@ -538,7 +385,7 @@ boolean mqttConnect() {
     mqtt.setSocketTimeout(30);
     
     for (int i = 0; i < 3; i++) {
-        if (mqtt.connect(deviceId.c_str(), "tecnocons", "nonserve")) {
+        if (mqtt.connect(DEVICE_ID, "tecnocons", "nonserve")) {
             SerialMon.println(" success");
             
             mqtt.subscribe(topicTestLed);
@@ -652,6 +499,7 @@ void SendMqttDataTask() {
         }
         
         sentSampleCount++;
+        SerialMon.printf("Samples sent: %d/%d\n", sentSampleCount, MAX_SAMPLES_BEFORE_SLEEP);
     }
 }
 
@@ -714,35 +562,15 @@ void logConnectionStats() {
     if (millis() - lastLog > 60000) {
         lastLog = millis();
         
-        SerialMon.println("\n=== Status ===");
+        SerialMon.println("\n=== Connection Status ===");
+        SerialMon.printf("Device ID: %s\n", DEVICE_ID);
+        SerialMon.printf("APN: %s\n", APN);
         SerialMon.printf("Connected: %s\n", connectionOK ? "YES" : "NO");
         SerialMon.printf("Signal: %d\n", modem.getSignalQuality());
         SerialMon.printf("Battery: %.2fV\n", readBatteryVoltage());
         SerialMon.printf("Samples sent: %d/%d\n", sentSampleCount, MAX_SAMPLES_BEFORE_SLEEP);
-        SerialMon.println("=============\n");
-    }
-}
-
-// Controllo modalità configurazione
-void checkConfigMode() {
-    // Se alimentato via USB e sensore non collegato, attiva modalità config
-    float voltage = readBatteryVoltage();
-    if (voltage == 0) {  // Alimentato via USB
-        SerialMon.println("USB Power detected - Starting configuration mode");
-        setupAP();
-        
-        // Loop per gestire le richieste web
-        while (true) {
-            webServer.handleClient();
-            delay(10);
-            
-            // Lampeggio LED per indicare modalità config
-            static unsigned long lastBlink = 0;
-            if (millis() - lastBlink > 500) {
-                lastBlink = millis();
-                digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-            }
-        }
+        SerialMon.printf("Connection attempts: %d\n", connManager.attemptCount);
+        SerialMon.println("========================\n");
     }
 }
 
@@ -756,17 +584,16 @@ void setup() {
     delay(100);
     
     SerialMon.println("\n\n=== RailTemp Temperature Monitor ===");
-    SerialMon.println("Version: 2.0 - Temperature Only Edition");
+    SerialMon.println("Version: 2.1 - Simplified");
+    SerialMon.printf("Device ID: %s\n", DEVICE_ID);
+    SerialMon.printf("APN: %s\n", APN);
+    SerialMon.println("====================================\n");
     
     // Configurazione pin
     pinMode(LED_PIN, OUTPUT);
     pinMode(BATTERY_PIN, INPUT);
     
-    // Controlla se entrare in modalità configurazione
-    checkConfigMode();
-    
-    // Carica configurazione
-    loadConfiguration();
+    // Aggiorna topic MQTT
     updateMqttTopics();
     
     // Inizializza sensore temperatura
@@ -775,6 +602,9 @@ void setup() {
         SerialMon.println("WARNING: No temperature sensor found!");
     } else {
         SerialMon.println("Temperature sensor initialized");
+        sensors.requestTemperatures();
+        float testTemp = sensors.getTempCByIndex(0);
+        SerialMon.printf("Test reading: %.1f°C\n", testTemp);
     }
     
     // Disabilita WiFi per risparmio energetico
@@ -795,7 +625,7 @@ void setup() {
     mqtt.setServer(broker, 1883);
     mqtt.setCallback(mqttCallback);
     
-    SerialMon.println("Setup completed\n");
+    SerialMon.println("Setup completed - Starting main loop\n");
 }
 
 // Loop principale
