@@ -54,7 +54,7 @@ const char* config_file = "/config.json";
 
 // Configurazioni modificabili
 String deviceId = "RailTemp00";
-String apnConfig = "shared.tids.tim.it";  // APN configurabile
+String apnConfig = "shared.tids.tim.it";  // APN configurabile "wsim per apn wherever"
 
 // Credenziali GPRS (solitamente vuote)
 const char gprsUser[] = "";
