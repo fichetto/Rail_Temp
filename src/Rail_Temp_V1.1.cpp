@@ -264,10 +264,12 @@ bool connectToNetwork() {
 bool connectToGPRS() {
     SerialMon.println("Connecting to GPRS...");
     
+    // Chiudi eventuali connessioni precedenti
     modem.sendAT("+CIPSHUT");
     modem.waitResponse(20000L);
     delay(2000);
     
+    // Se non è il primo tentativo, fai un ciclo detach/attach
     if (connManager.attemptCount > 1) {
         SerialMon.println("GPRS detach/attach cycle...");
         modem.sendAT("+CGATT=0");
@@ -275,38 +277,31 @@ bool connectToGPRS() {
         delay(5000);
     }
     
-    modem.sendAT("+CGATT=1");
-    if (modem.waitResponse(120000L) != 1) {
-        SerialMon.println("GPRS attach failed");
-        return false;
-    }
+    // Usa il metodo gprsConnect di TinyGSM invece di comandi AT diretti
+    SerialMon.println("Connecting to GPRS using TinyGSM method...");
     
-    for (int retry = 0; retry < 3; retry++) {
-        SerialMon.printf("Activating PDP context (attempt %d/3)...\n", retry + 1);
+    // Tentativi multipli con il metodo gprsConnect
+    for (int i = 0; i < 3; i++) {
+        SerialMon.printf("GPRS connection attempt %d/3...\n", i + 1);
         
-        modem.sendAT("+CGACT=1,1");
-        if (modem.waitResponse(150000L) == 1) {
-            SerialMon.println("PDP context activated");
-            break;
+        if (modem.gprsConnect(APN, gprsUser, gprsPass)) {
+            SerialMon.println("GPRS connected successfully!");
+            
+            // Verifica l'IP ottenuto
+            String ip = modem.getLocalIP();
+            if (ip != "") {
+                SerialMon.println("Got IP address: " + ip);
+                return true;
+            } else {
+                SerialMon.println("Connected but no IP assigned");
+            }
         }
         
-        if (retry == 2) {
-            SerialMon.println("Failed to activate PDP context");
-            return false;
-        }
-        delay(10000);
+        SerialMon.println("GPRS connection failed, retrying...");
+        delay(5000);
     }
     
-    delay(5000);
-    
-    if (!modem.isGprsConnected()) {
-        SerialMon.println("GPRS not connected");
-        return false;
-    }
-    
-    String ip = modem.getLocalIP();
-    SerialMon.println("GPRS Connected! IP: " + ip);
-    return true;
+    return false;
 }
 
 // Gestione connessione con backoff progressivo
