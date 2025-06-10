@@ -5,7 +5,7 @@
 #include <DallasTemperature.h>
 
 // ===== CONFIGURAZIONE DISPOSITIVO - MODIFICARE SOLO QUESTE DUE RIGHE =====
-const char* DEVICE_ID = "RailTemp02";              // ID del dispositivo
+const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
 const char* APN = "shared.tids.tim.it";            // APN dell'operatore
 // ========================================================================
 
@@ -232,23 +232,20 @@ bool connectToNetwork() {
     
     unsigned long startTime = millis();
     while (millis() - startTime < (maxWaitTime * 1000UL)) {
-        if (modem.isNetworkConnected()) {
-            int signal = modem.getSignalQuality();
+        // Controlla il segnale - se non è 99, siamo connessi
+        int signal = modem.getSignalQuality();
+        
+        if (signal != 99 && signal > 0) {
             SerialMon.printf("Network connected! Signal: %d\n", signal);
             
-            if (signal < 10 && signal != 99) {
-                SerialMon.println("Weak signal, waiting...");
-                delay(10000);
-                continue;
-            }
-            
+            // Ottieni operatore
             String cop = modem.getOperator();
             SerialMon.println("Operator: " + cop);
+            
             return true;
         }
         
         if ((millis() - startTime) % 5000 < 100) {
-            int signal = modem.getSignalQuality();
             SerialMon.printf("Waiting... Signal: %d, Time: %lds/%ds\n", 
                            signal, (millis() - startTime) / 1000, maxWaitTime);
         }
@@ -264,43 +261,20 @@ bool connectToNetwork() {
 bool connectToGPRS() {
     SerialMon.println("Connecting to GPRS...");
     
-    // Chiudi eventuali connessioni precedenti
-    modem.sendAT("+CIPSHUT");
-    modem.waitResponse(20000L);
-    delay(2000);
+    // Usa direttamente il metodo gprsConnect di TinyGSM
+    SerialMon.printf("Attempting GPRS connection with APN: %s\n", APN);
     
-    // Se non è il primo tentativo, fai un ciclo detach/attach
-    if (connManager.attemptCount > 1) {
-        SerialMon.println("GPRS detach/attach cycle...");
-        modem.sendAT("+CGATT=0");
-        modem.waitResponse(30000L);
-        delay(5000);
+    if (modem.gprsConnect(APN, gprsUser, gprsPass)) {
+        SerialMon.println("GPRS connected!");
+        
+        // Verifica IP
+        String ip = modem.getLocalIP();
+        SerialMon.println("IP address: " + ip);
+        
+        return true;
     }
     
-    // Usa il metodo gprsConnect di TinyGSM invece di comandi AT diretti
-    SerialMon.println("Connecting to GPRS using TinyGSM method...");
-    
-    // Tentativi multipli con il metodo gprsConnect
-    for (int i = 0; i < 3; i++) {
-        SerialMon.printf("GPRS connection attempt %d/3...\n", i + 1);
-        
-        if (modem.gprsConnect(APN, gprsUser, gprsPass)) {
-            SerialMon.println("GPRS connected successfully!");
-            
-            // Verifica l'IP ottenuto
-            String ip = modem.getLocalIP();
-            if (ip != "") {
-                SerialMon.println("Got IP address: " + ip);
-                return true;
-            } else {
-                SerialMon.println("Connected but no IP assigned");
-            }
-        }
-        
-        SerialMon.println("GPRS connection failed, retrying...");
-        delay(5000);
-    }
-    
+    SerialMon.println("GPRS connection failed");
     return false;
 }
 
