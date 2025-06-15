@@ -93,6 +93,13 @@ uint32_t lastReconnectAttempt = 0;
 int sentSampleCount = 0;
 float batteryVoltage = 0;
 
+// Variabili per gestione GPS fix
+bool gpsFixObtained = false;
+unsigned long gpsWaitStartTime = 0;
+const unsigned long GPS_WAIT_TIMEOUT = 600000;  // 10 minuti
+const float BATTERY_GPS_WAIT_THRESHOLD = 3.9;   // Soglia per attesa GPS
+bool waitingForGPS = false;
+
 // Dichiarazioni funzioni
 void modemPowerOn();
 void modemPowerOff();
@@ -154,9 +161,39 @@ void modemRestart() {
 // Gestione GPS
 void enableGPS() {
     SerialMon.println("Enabling GPS...");
+    
+    // Prima verifica lo stato
+    modem.sendAT("+CGPS?");
+    String response;
+    if (modem.waitResponse(1000L, response) == 1) {
+        SerialMon.println("Current GPS state: " + response);
+    }
+    
+    // Abilita alimentazione GPS
     modem.sendAT("+SGPIO=0,4,1,1");
-    modem.waitResponse(10000L);
-    modem.enableGPS();
+    if (modem.waitResponse(10000L) != 1) {
+        SerialMon.println("Failed to power GPS");
+    }
+    
+    // Abilita GPS
+    if (modem.enableGPS()) {
+        SerialMon.println("GPS enabled successfully");
+    } else {
+        SerialMon.println("Failed to enable GPS");
+        
+        // Prova metodo alternativo
+        modem.sendAT("+CGPS=1,1");
+        if (modem.waitResponse(5000L) == 1) {
+            SerialMon.println("GPS enabled with AT command");
+        }
+    }
+    
+    // Verifica finale
+    delay(1000);
+    modem.sendAT("+CGPS?");
+    if (modem.waitResponse(1000L, response) == 1) {
+        SerialMon.println("GPS state after enable: " + response);
+    }
 }
 
 void disableGPS() {
@@ -389,16 +426,88 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
 void SendMqttDataTask() {
     batteryVoltage = readBatteryVoltage();
     
-    // Controllo per deep sleep dopo 3 invii
-    if (sentSampleCount >= MAX_SAMPLES_BEFORE_SLEEP && batteryVoltage > 0) {
-        SerialMon.println("Max samples sent - going to deep sleep");
-        modemPowerOff();
-        delay(5000);
-        goToDeepSleep(TIME_TO_SLEEP_DAY);
-    }
-
+    // Se non siamo connessi, esci
     if (!connectionOK) {
         return;
+    }
+    
+    // NUOVA LOGICA: Gestione attesa GPS se batteria > 3.9V
+    if (!gpsFixObtained && batteryVoltage > BATTERY_GPS_WAIT_THRESHOLD && batteryVoltage > 0.5) {
+        // Inizializza timer attesa GPS se non già fatto
+        if (gpsWaitStartTime == 0) {
+            gpsWaitStartTime = millis();
+            waitingForGPS = true;
+            SerialMon.println("Battery > 3.9V - Waiting for GPS fix...");
+            SerialMon.printf("Battery voltage: %.2fV\n", batteryVoltage);
+        }
+        
+        // Controlla timeout 10 minuti
+        if (millis() - gpsWaitStartTime > GPS_WAIT_TIMEOUT) {
+            SerialMon.println("GPS wait timeout (10 minutes) - proceeding without fix");
+            waitingForGPS = false;
+            gpsFixObtained = true; // Forza uscita da attesa
+        }
+        
+        // Controlla se batteria è scesa sotto soglia
+        if (batteryVoltage <= BATTERY_GPS_WAIT_THRESHOLD) {
+            SerialMon.printf("Battery dropped to %.2fV - proceeding without GPS fix\n", batteryVoltage);
+            waitingForGPS = false;
+            gpsFixObtained = true; // Forza uscita da attesa
+        }
+        
+        // Se ancora in attesa, controlla GPS
+        if (waitingForGPS) {
+            // Prova a ottenere fix GPS
+            float lat = 0, lon = 0;
+            bool gpsSuccess = modem.getGPS(&lat, &lon);
+            
+            if (gpsSuccess && (lat != 0 || lon != 0)) {
+                SerialMon.printf("GPS FIX OBTAINED! Lat: %.6f, Lon: %.6f\n", lat, lon);
+                SerialMon.printf("Wait time: %lu seconds\n", (millis() - gpsWaitStartTime) / 1000);
+                gpsFixObtained = true;
+                waitingForGPS = false;
+            } else {
+                // Ancora in attesa - log ogni 10 secondi
+                static unsigned long lastWaitLog = 0;
+                if (millis() - lastWaitLog > 10000) {
+                    lastWaitLog = millis();
+                    SerialMon.printf("Waiting for GPS... Time: %lus, Battery: %.2fV\n", 
+                                   (millis() - gpsWaitStartTime) / 1000, batteryVoltage);
+                }
+                return; // Esci senza inviare dati
+            }
+        }
+    }
+    
+    // Da qui in poi, procediamo con l'invio normale dei dati
+    
+    // Controllo per deep sleep dopo 3 invii
+    if (sentSampleCount >= MAX_SAMPLES_BEFORE_SLEEP) {
+        // Lampeggio rapido 5 volte per indicare tentativo deep sleep
+        for(int i = 0; i < 5; i++) {
+            digitalWrite(LED_PIN, HIGH);
+            delay(100);
+            digitalWrite(LED_PIN, LOW);
+            delay(100);
+        }
+        
+        if (batteryVoltage > 0.5) {  // Soglia per distinguere USB da batteria
+            SerialMon.println("Max samples sent - going to deep sleep");
+            SerialMon.printf("Battery voltage: %.2fV\n", batteryVoltage);
+            modemPowerOff();
+            delay(5000);
+            goToDeepSleep(TIME_TO_SLEEP_DAY);
+        } else {
+            SerialMon.println("USB powered (voltage < 0.5V) - skip deep sleep");
+            sentSampleCount = 0;  // Reset counter
+            gpsFixObtained = false;  // Reset GPS flag per prossimo ciclo
+            gpsWaitStartTime = 0;
+            
+            // Lampeggio lungo per indicare reset counter
+            digitalWrite(LED_PIN, HIGH);
+            delay(1000);
+            digitalWrite(LED_PIN, LOW);
+        }
     }
 
     // Gestione riconnessione MQTT
@@ -457,14 +566,47 @@ void SendMqttDataTask() {
         SerialMon.println(signalStr);
         
         // Invio posizione GPS (se disponibile)
-        float lat, lon;
-        if (modem.getGPS(&lat, &lon)) {
-            char latStr[15], lonStr[15];
-            dtostrf(lat, 10, 6, latStr);
-            dtostrf(lon, 10, 6, lonStr);
-            mqtt.publish(topicGPSlat, latStr);
-            mqtt.publish(topicGPSlon, lonStr);
-            SerialMon.printf("GPS sent: %s, %s\n", latStr, lonStr);
+        SerialMon.println("Attempting to get GPS data...");
+
+        // Prima verifica se il GPS è abilitato
+        modem.sendAT("+CGPS?");
+        String gpsStatus;
+        if (modem.waitResponse(1000L, gpsStatus) == 1) {
+            SerialMon.println("GPS Status: " + gpsStatus);
+        }
+
+        // Prova a ottenere i dati GPS
+        float lat = 0, lon = 0, speed = 0, alt = 0, accuracy = 0;
+        int vsat = 0, usat = 0;
+        int year = 0, month = 0, day = 0, hour = 0, min = 0, sec = 0;
+
+        bool gpsSuccess = modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &accuracy, 
+                                       &year, &month, &day, &hour, &min, &sec);
+
+        if (gpsSuccess) {
+            SerialMon.printf("GPS SUCCESS - Lat: %.6f, Lon: %.6f\n", lat, lon);
+            SerialMon.printf("Satellites: %d visible, %d used\n", vsat, usat);
+            SerialMon.printf("Accuracy: %.1f meters\n", accuracy);
+            
+            if (lat != 0 || lon != 0) {
+                char latStr[15], lonStr[15];
+                dtostrf(lat, 10, 6, latStr);
+                dtostrf(lon, 10, 6, lonStr);
+                mqtt.publish(topicGPSlat, latStr);
+                mqtt.publish(topicGPSlon, lonStr);
+                SerialMon.printf("GPS published: %s, %s\n", latStr, lonStr);
+            } else {
+                SerialMon.println("GPS fix obtained but coordinates are 0,0");
+            }
+        } else {
+            SerialMon.println("GPS FAILED - No fix available");
+            
+            // Controlla i dati GPS raw
+            modem.sendAT("+CGPSINFO");
+            String gpsInfo;
+            if (modem.waitResponse(2000L, gpsInfo) == 1) {
+                SerialMon.println("GPS Raw Info: " + gpsInfo);
+            }
         }
         
         sentSampleCount++;
@@ -583,6 +725,11 @@ void setup() {
     // Reset contatore campioni
     sentSampleCount = 0;
     
+    // Reset variabili GPS
+    gpsFixObtained = false;
+    gpsWaitStartTime = 0;
+    waitingForGPS = false;
+    
     // Inizializza modem
     modemPowerOn();
     delay(1000);
@@ -603,13 +750,28 @@ void loop() {
     SendMqttDataTask();
     logConnectionStats();
     
-    // Blink LED ogni 10 secondi se connesso
+    // Indicazione LED dello stato
     static unsigned long lastBlink = 0;
-    if (connectionOK && millis() - lastBlink > 10000) {
+    
+    // Se in attesa GPS, lampeggio veloce
+    if (waitingForGPS) {
+        static unsigned long lastGPSBlink = 0;
+        if (millis() - lastGPSBlink > 200) {  // Lampeggio ogni 200ms
+            lastGPSBlink = millis();
+            digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+        }
+    }
+    // Altrimenti, lampeggio normale per indicare campioni inviati
+    else if (connectionOK && millis() - lastBlink > 10000) {
         lastBlink = millis();
-        digitalWrite(LED_PIN, HIGH);
-        delay(50);
-        digitalWrite(LED_PIN, LOW);
+        
+        // Numero di lampeggi = numero di campioni inviati
+        for(int i = 0; i < sentSampleCount; i++) {
+            digitalWrite(LED_PIN, HIGH);
+            delay(200);
+            digitalWrite(LED_PIN, LOW);
+            delay(200);
+        }
     }
     
     delay(100);
