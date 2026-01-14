@@ -5,8 +5,8 @@
 #include <DallasTemperature.h>
 
 // ===== CONFIGURAZIONE DISPOSITIVO - MODIFICARE SOLO QUESTE DUE RIGHE =====
-const char* DEVICE_ID = "Railtemp05";              // ID del dispositivo
-const char* APN = "wsim";                          // APN dell'operatore "WSIM per wherever"
+const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
+const char* APN = "shared.tids.tim.it";            // APN dell'operatore TIM
 // ========================================================================
 
 // Configurazione pin sensore temperatura
@@ -43,7 +43,7 @@ DallasTemperature sensors(&oneWire);
 #define MAX_SAMPLES_BEFORE_SLEEP 3
 
 // Configurazione attesa GPS
-#define GPS_FIX_TIMEOUT 90000           // 90 secondi massimo per GPS fix
+#define GPS_FIX_TIMEOUT 300000          // 5 minuti massimo per GPS fix (era 90s)
 #define GPS_CHECK_INTERVAL 5000         // Controlla GPS ogni 5 secondi
 
 #include <TinyGsmClient.h>
@@ -102,6 +102,37 @@ float batteryVoltage = 0;
 bool gpsFixObtained = false;
 bool isDayTime = false;
 bool timeKnown = false;
+bool gpsCurrentlyEnabled = false;
+
+// Cache GPS per riutilizzo ultimo fix valido
+struct GPSCache {
+    bool hasValidFix = false;
+    float latitude = 0.0f;
+    float longitude = 0.0f;
+    String utcTime = "";
+    unsigned long lastFixTime = 0;
+    const unsigned long MAX_CACHE_AGE = 3600000;  // 1 ora validità cache
+
+    bool isValid() {
+        return hasValidFix && (millis() - lastFixTime < MAX_CACHE_AGE);
+    }
+
+    void update(float lat, float lon, String utc) {
+        latitude = lat;
+        longitude = lon;
+        utcTime = utc;
+        lastFixTime = millis();
+        hasValidFix = true;
+    }
+
+    void clear() {
+        hasValidFix = false;
+        latitude = 0.0f;
+        longitude = 0.0f;
+        utcTime = "";
+        lastFixTime = 0;
+    }
+} gpsCache;
 
 // Dichiarazioni funzioni
 void modemPowerOn();
@@ -191,36 +222,50 @@ void sendATCommand(String cmd, int timeout) {
 
 // Gestione GPS MIGLIORATA con metodi dal test script
 void enableGPS() {
+    if (gpsCurrentlyEnabled) {
+        SerialMon.println("GPS già abilitato, skip");
+        return;
+    }
+
     SerialMon.println("\n=== ENABLING GPS ===");
-    
+
     // Power cycle GPS
     sendATCommand("+CGPS=0", 3000);
     sendATCommand("+SGPIO=0,4,1,0", 1000);  // Power OFF
     delay(2000);
     sendATCommand("+SGPIO=0,4,1,1", 1000);  // Power ON
     delay(2000);
-    
+
     // Configurazione GPS
     sendATCommand("+CGPSNMEA=2", 1000);
     sendATCommand("+CGPSINFOCFG=1,31", 1000);
     sendATCommand("+CGPSHOR=10", 1000);
     sendATCommand("+CGNSCFG=1", 1000);
     sendATCommand("+CGNSPWR=1", 1000);
-    
+
     // Enable GPS
     sendATCommand("+CGPS=1,1", 5000);
     delay(2000);
-    
+
     // Verifica stato
     sendATCommand("+CGPS?", 1000);
+    gpsCurrentlyEnabled = true;
     SerialMon.println("=== GPS ENABLE COMPLETE ===\n");
 }
 
 void disableGPS() {
+    if (!gpsCurrentlyEnabled) {
+        SerialMon.println("GPS già disabilitato, skip");
+        return;
+    }
+
+    SerialMon.println("Disabilitazione GPS per risparmio energetico...");
     modem.sendAT("+CGPS=0");
     modem.waitResponse(2000L);
     modem.sendAT("+SGPIO=0,4,1,0");
     modem.waitResponse(2000L);
+    gpsCurrentlyEnabled = false;
+    SerialMon.println("GPS disabilitato");
 }
 
 // Test GPS con metodo standard migliorato
@@ -237,7 +282,18 @@ bool testGPSStandard() {
     while (millis() - startTime < GPS_FIX_TIMEOUT) {
         if ((millis() - startTime) > checkCount * GPS_CHECK_INTERVAL) {
             checkCount++;
-            
+
+            // Controllo batteria ogni 30 secondi (ogni 6 check)
+            if (checkCount % 6 == 0) {
+                float currentBatt = readBatteryVoltage();
+                if (currentBatt < 3.4 && currentBatt > 0.5) {
+                    SerialMon.println("\n!!! BATTERIA CRITICA durante acquisizione GPS !!!");
+                    SerialMon.printf("Tensione: %.2fV - Interrompo ricerca GPS\n", currentBatt);
+                    return false;
+                }
+                SerialMon.printf("Batteria: %.2fV - OK\n", currentBatt);
+            }
+
             // Usa CGNSINF che funziona meglio
             modem.sendAT("+CGNSINF");
             String cgnsinf = "";
@@ -275,21 +331,28 @@ bool testGPSStandard() {
                     
                     float lat = latStr.toFloat();
                     float lon = lonStr.toFloat();
-                    
+
                     if (lat != 0.0f || lon != 0.0f) {
-                        SerialMon.printf("GPS FIX: %s, %s @ %s UTC\n", 
+                        SerialMon.printf("GPS FIX: %s, %s @ %s UTC\n",
                                         latStr.c_str(), lonStr.c_str(), utcStr.c_str());
-                        
+
+                        // Salva in cache
+                        gpsCache.update(lat, lon, utcStr);
+                        SerialMon.println("GPS fix salvato in cache");
+
                         // Determina se è giorno o notte dall'ora UTC
                         if (utcStr.length() >= 6) {
                             int hour = utcStr.substring(8, 10).toInt();
                             // Considera giorno dalle 6 alle 18 UTC
                             isDayTime = (hour >= 6 && hour < 18);
                             timeKnown = true;
-                            SerialMon.printf("Ora UTC: %02d, Periodo: %s\n", 
+                            SerialMon.printf("Ora UTC: %02d, Periodo: %s\n",
                                            hour, isDayTime ? "GIORNO" : "NOTTE");
                         }
-                        
+
+                        // Mantieni GPS acceso per fix futuri (non spegnere)
+                        SerialMon.println("GPS rimane acceso per fix futuri");
+
                         return true;
                     }
                 }
@@ -309,20 +372,35 @@ bool testGPSStandard() {
 // Attesa GPS fix dopo connessione
 bool waitForGPSFix() {
     SerialMon.println("\n=== WAITING FOR GPS FIX ===");
-    
+
+    // Controlla se c'è un fix valido in cache
+    if (gpsCache.isValid()) {
+        unsigned long cacheAge = (millis() - gpsCache.lastFixTime) / 1000;
+        SerialMon.printf("Cache GPS valida! Età: %lu secondi\n", cacheAge);
+        SerialMon.printf("Usando coordinate cached: %.6f, %.6f\n",
+                        gpsCache.latitude, gpsCache.longitude);
+        gpsFixObtained = true;
+
+        // Non serve accendere GPS, usiamo cache
+        return true;
+    }
+
+    SerialMon.println("Nessuna cache GPS valida, acquisizione nuovo fix...");
+
     // Abilita GPS se non già attivo
     enableGPS();
-    
+
     // Prova ad ottenere fix
     bool fixObtained = testGPSStandard();
-    
+
     if (fixObtained) {
         gpsFixObtained = true;
-        SerialMon.println("GPS FIX ottenuto!");
+        SerialMon.println("GPS FIX ottenuto! GPS rimane acceso.");
     } else {
-        SerialMon.println("GPS FIX non ottenuto - continuo comunque");
+        SerialMon.println("GPS FIX non ottenuto dopo timeout - GPS rimane acceso");
+        SerialMon.println("Continuo comunque, riprover\u00f2 durante trasmissione dati");
     }
-    
+
     return fixObtained;
 }
 
@@ -532,6 +610,42 @@ void SendMqttDataTask() {
     
     // Controllo per deep sleep dopo 3 invii
     if (sentSampleCount >= MAX_SAMPLES_BEFORE_SLEEP) {
+        // Verifica se abbiamo mai ottenuto un fix GPS
+        if (!gpsCache.hasValidFix) {
+            // PROTEZIONE BATTERIA: se batteria troppo bassa, vai in sleep anche senza GPS
+            if (batteryVoltage < 3.4 && batteryVoltage > 0.5) {
+                SerialMon.println("ATTENZIONE: Batteria critica!");
+                SerialMon.printf("Tensione: %.2fV - Vado in deep sleep per preservare batteria\n", batteryVoltage);
+
+                // Lampeggio rosso (veloce) 10 volte per segnalare batteria critica
+                for(int i = 0; i < 10; i++) {
+                    digitalWrite(LED_PIN, HIGH);
+                    delay(50);
+                    digitalWrite(LED_PIN, LOW);
+                    delay(50);
+                }
+
+                // Vai in deep sleep lungo per preservare batteria
+                modemPowerOff();
+                delay(5000);
+                goToDeepSleep(TIME_TO_SLEEP_LOW_BATTERY);
+                return;
+            }
+
+            SerialMon.println("ATTENZIONE: Nessun fix GPS mai ottenuto!");
+            SerialMon.printf("Batteria: %.2fV - Continuo a cercare GPS...\n", batteryVoltage);
+            sentSampleCount = 0;  // Reset counter per evitare loop
+
+            // Lampeggio lento per indicare ricerca GPS
+            for(int i = 0; i < 3; i++) {
+                digitalWrite(LED_PIN, HIGH);
+                delay(500);
+                digitalWrite(LED_PIN, LOW);
+                delay(500);
+            }
+            return;  // Non andare in deep sleep
+        }
+
         // Lampeggio rapido 5 volte per indicare tentativo deep sleep
         for(int i = 0; i < 5; i++) {
             digitalWrite(LED_PIN, HIGH);
@@ -539,10 +653,11 @@ void SendMqttDataTask() {
             digitalWrite(LED_PIN, LOW);
             delay(100);
         }
-        
+
         if (batteryVoltage > 0.5) {  // Soglia per distinguere USB da batteria
             SerialMon.println("Max samples sent - going to deep sleep");
             SerialMon.printf("Battery voltage: %.2fV\n", batteryVoltage);
+            SerialMon.println("GPS fix presente in cache, OK per sleep");
             
             // Determina tempo di sleep in base all'ora
             uint64_t sleepTime;
@@ -628,57 +743,132 @@ void SendMqttDataTask() {
         
         // GPS DEBUG & PUBLISH
         SerialMon.println("\n--- GPS DEBUG ---");
-        modem.sendAT("+CGNSINF");
-        String cgnsinf = "";
-        if (modem.waitResponse(3000L, cgnsinf) == 1) {
-            cgnsinf.trim();
-            SerialMon.println("CGNSINF: " + cgnsinf);
-            
-            if (cgnsinf.startsWith("+CGNSINF: 0")) {
-                SerialMon.println("GNSS core is OFF, forcing ON...");
-                enableGPS();
-                return;
-            }
-            
-            int pos = cgnsinf.indexOf("+CGNSINF: 1,");
-            bool fixOk = (pos >= 0 && cgnsinf.charAt(pos + 12) != '0');
-            if (fixOk) {
-                // Estrazione campi
-                int start = pos, field = 0;
-                String utcStr, latStr, lonStr;
-                while (field < 6 && start > -1) {
-                    int next = cgnsinf.indexOf(',', start);
-                    if (next == -1) break;
-                    switch (field) {
-                        case 2: utcStr = cgnsinf.substring(start, next); break;
-                        case 3: latStr = cgnsinf.substring(start, next); break;
-                        case 4: lonStr = cgnsinf.substring(start, next); break;
+
+        // Controlla se abbiamo cache valida
+        if (gpsCache.isValid()) {
+            unsigned long cacheAge = (millis() - gpsCache.lastFixTime) / 1000;
+            SerialMon.printf("Usando GPS cache (età: %lu s)\n", cacheAge);
+
+            // Pubblica dati dalla cache
+            char latStr[16], lonStr[16];
+            dtostrf(gpsCache.latitude, 10, 6, latStr);
+            dtostrf(gpsCache.longitude, 10, 6, lonStr);
+
+            mqtt.publish(topicGPSlat, latStr);
+            mqtt.publish(topicGPSlon, lonStr);
+            mqtt.publish(topicDateTime, gpsCache.utcTime.c_str());
+            SerialMon.printf("GPS PUBLISHED (cache): %s, %s @ %s UTC\n",
+                            latStr, lonStr, gpsCache.utcTime.c_str());
+
+            // GPS sempre acceso, prova comunque a refreshare cache
+            SerialMon.println("Tento refresh cache GPS...");
+
+            modem.sendAT("+CGNSINF");
+            String cgnsinf = "";
+            if (modem.waitResponse(3000L, cgnsinf) == 1) {
+                cgnsinf.trim();
+                int pos = cgnsinf.indexOf("+CGNSINF: 1,");
+                bool fixOk = (pos >= 0 && cgnsinf.charAt(pos + 12) != '0');
+                if (fixOk) {
+                    // Estrazione rapida campi per aggiornare cache
+                    int start = pos, field = 0;
+                    String utcStr, newLatStr, newLonStr;
+                    while (field < 6 && start > -1) {
+                        int next = cgnsinf.indexOf(',', start);
+                        if (next == -1) break;
+                        switch (field) {
+                            case 2: utcStr = cgnsinf.substring(start, next); break;
+                            case 3: newLatStr = cgnsinf.substring(start, next); break;
+                            case 4: newLonStr = cgnsinf.substring(start, next); break;
+                        }
+                        start = next + 1;
+                        field++;
                     }
-                    start = next + 1; 
-                    field++;
+
+                    float lat = newLatStr.toFloat();
+                    float lon = newLonStr.toFloat();
+                    if (lat != 0.0f || lon != 0.0f) {
+                        gpsCache.update(lat, lon, utcStr);
+                        SerialMon.println("Cache GPS aggiornata con nuovo fix");
+
+                        // Aggiorna info giorno/notte
+                        if (utcStr.length() >= 8) {
+                            int hour = utcStr.substring(8, 10).toInt();
+                            isDayTime = (hour >= 6 && hour < 18);
+                            timeKnown = true;
+                        }
+                    }
+                } else {
+                    SerialMon.println("Nessun nuovo fix disponibile");
                 }
-                
-                float lat = latStr.toFloat();
-                float lon = lonStr.toFloat();
-                if (lat != 0.0f || lon != 0.0f) {
-                    mqtt.publish(topicGPSlat, latStr.c_str());
-                    mqtt.publish(topicGPSlon, lonStr.c_str());
-                    mqtt.publish(topicDateTime, utcStr.c_str());  // Pubblica ora UTC
-                    SerialMon.printf("GPS PUBLISHED: %s, %s @ %s UTC\n",
-                                    latStr.c_str(), lonStr.c_str(), utcStr.c_str());
-                    gpsFixObtained = true;
-                    
-                    // Aggiorna info giorno/notte con ora UTC
-                    if (utcStr.length() >= 8) {
-                        int hour = utcStr.substring(8, 10).toInt();
-                        isDayTime = (hour >= 6 && hour < 18);
-                        timeKnown = true;
-                        SerialMon.printf("Ora UTC: %02d, Periodo: %s\n", 
-                                       hour, isDayTime ? "GIORNO" : "NOTTE");
+            }
+        } else {
+            // Nessuna cache valida, prova ad ottenere fix
+            SerialMon.println("Nessuna cache GPS, tentativo acquisizione...");
+            modem.sendAT("+CGNSINF");
+            String cgnsinf = "";
+            if (modem.waitResponse(3000L, cgnsinf) == 1) {
+                cgnsinf.trim();
+                SerialMon.println("CGNSINF: " + cgnsinf);
+
+                if (cgnsinf.startsWith("+CGNSINF: 0")) {
+                    SerialMon.println("GNSS core is OFF, forcing ON...");
+                    enableGPS();
+                    return;
+                }
+
+                int pos = cgnsinf.indexOf("+CGNSINF: 1,");
+                bool fixOk = (pos >= 0 && cgnsinf.charAt(pos + 12) != '0');
+                if (fixOk) {
+                    // Estrazione campi
+                    int start = pos, field = 0;
+                    String utcStr, latStr, lonStr;
+                    while (field < 6 && start > -1) {
+                        int next = cgnsinf.indexOf(',', start);
+                        if (next == -1) break;
+                        switch (field) {
+                            case 2: utcStr = cgnsinf.substring(start, next); break;
+                            case 3: latStr = cgnsinf.substring(start, next); break;
+                            case 4: lonStr = cgnsinf.substring(start, next); break;
+                        }
+                        start = next + 1;
+                        field++;
                     }
+
+                    float lat = latStr.toFloat();
+                    float lon = lonStr.toFloat();
+                    if (lat != 0.0f || lon != 0.0f) {
+                        // Salva in cache
+                        gpsCache.update(lat, lon, utcStr);
+
+                        mqtt.publish(topicGPSlat, latStr.c_str());
+                        mqtt.publish(topicGPSlon, lonStr.c_str());
+                        mqtt.publish(topicDateTime, utcStr.c_str());
+                        SerialMon.printf("GPS PUBLISHED: %s, %s @ %s UTC\n",
+                                        latStr.c_str(), lonStr.c_str(), utcStr.c_str());
+                        gpsFixObtained = true;
+
+                        // Aggiorna info giorno/notte con ora UTC
+                        if (utcStr.length() >= 8) {
+                            int hour = utcStr.substring(8, 10).toInt();
+                            isDayTime = (hour >= 6 && hour < 18);
+                            timeKnown = true;
+                            SerialMon.printf("Ora UTC: %02d, Periodo: %s\n",
+                                           hour, isDayTime ? "GIORNO" : "NOTTE");
+                        }
+
+                        // GPS rimane acceso
+                        SerialMon.println("GPS fix ottenuto e salvato");
+                    }
+                } else {
+                    SerialMon.println("No valid GPS fix in CGNSINF");
                 }
             } else {
-                SerialMon.println("No valid GPS fix in CGNSINF");
+                // Nessuna risposta CGNSINF, assicurati che GPS sia acceso
+                if (!gpsCurrentlyEnabled) {
+                    SerialMon.println("GPS non risponde, tento riattivazione...");
+                    enableGPS();
+                }
             }
         }
         
@@ -721,8 +911,16 @@ void logConnectionStats() {
         SerialMon.printf("Samples sent: %d/%d\n", sentSampleCount, MAX_SAMPLES_BEFORE_SLEEP);
         SerialMon.printf("Connection attempts: %d\n", connManager.attemptCount);
         SerialMon.printf("GPS fix obtained: %s\n", gpsFixObtained ? "YES" : "NO");
-        SerialMon.printf("Time known: %s, Period: %s\n", 
-                        timeKnown ? "YES" : "NO", 
+        SerialMon.printf("GPS enabled: %s\n", gpsCurrentlyEnabled ? "YES" : "NO");
+        SerialMon.printf("GPS cache: %s", gpsCache.hasValidFix ? "VALID" : "INVALID");
+        if (gpsCache.hasValidFix) {
+            unsigned long age = (millis() - gpsCache.lastFixTime) / 1000;
+            SerialMon.printf(" (age: %lu s)\n", age);
+        } else {
+            SerialMon.println();
+        }
+        SerialMon.printf("Time known: %s, Period: %s\n",
+                        timeKnown ? "YES" : "NO",
                         timeKnown ? (isDayTime ? "GIORNO" : "NOTTE") : "N/A");
         SerialMon.println("========================\n");
     }
@@ -761,7 +959,9 @@ void setup() {
     gpsFixObtained = false;
     timeKnown = false;
     isDayTime = false;
-    
+    gpsCurrentlyEnabled = false;
+    gpsCache.clear();
+
     mqtt.setServer(broker, 1883);
     mqtt.setCallback(mqttCallback);
     
