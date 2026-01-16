@@ -220,37 +220,37 @@ void sendATCommand(String cmd, int timeout) {
     }
 }
 
-// Gestione GPS MIGLIORATA con metodi dal test script
+// Gestione GPS con comandi CGNS corretti per SIM7000G
+// NOTA: SIM7000G usa AT+CGNS*, NON AT+CGPS*
 void enableGPS() {
     if (gpsCurrentlyEnabled) {
         SerialMon.println("GPS già abilitato, skip");
         return;
     }
 
-    SerialMon.println("\n=== ENABLING GPS ===");
+    SerialMon.println("\n=== ENABLING GNSS ===");
 
-    // Power cycle GPS
-    sendATCommand("+CGPS=0", 3000);
-    sendATCommand("+SGPIO=0,4,1,0", 1000);  // Power OFF
-    delay(2000);
-    sendATCommand("+SGPIO=0,4,1,1", 1000);  // Power ON
-    delay(2000);
+    // 1. Spegni GNSS se attivo
+    sendATCommand("+CGNSPWR=0", 2000);
+    delay(1000);
 
-    // Configurazione GPS
-    sendATCommand("+CGPSNMEA=2", 1000);
-    sendATCommand("+CGPSINFOCFG=1,31", 1000);
-    sendATCommand("+CGPSHOR=10", 1000);
-    sendATCommand("+CGNSCFG=1", 1000);
-    sendATCommand("+CGNSPWR=1", 1000);
+    // 2. Accendi antenna GPS via GPIO4 (specifico LilyGO T-SIM7000G)
+    sendATCommand("+SGPIO=0,4,1,1", 1000);
+    delay(1000);
 
-    // Enable GPS
-    sendATCommand("+CGPS=1,1", 5000);
+    // 3. Accendi GNSS
+    sendATCommand("+CGNSPWR=1", 2000);
     delay(2000);
 
-    // Verifica stato
-    sendATCommand("+CGPS?", 1000);
+    // 4. Verifica stato GNSS
+    modem.sendAT("+CGNSPWR?");
+    String response = "";
+    if (modem.waitResponse(2000L, response) == 1) {
+        SerialMon.println("GNSS Power status: " + response);
+    }
+
     gpsCurrentlyEnabled = true;
-    SerialMon.println("=== GPS ENABLE COMPLETE ===\n");
+    SerialMon.println("=== GNSS ENABLED ===\n");
 }
 
 void disableGPS() {
@@ -260,7 +260,8 @@ void disableGPS() {
     }
 
     SerialMon.println("Disabilitazione GPS per risparmio energetico...");
-    modem.sendAT("+CGPS=0");
+    // Usa CGNS per SIM7000G
+    modem.sendAT("+CGNSPWR=0");
     modem.waitResponse(2000L);
     modem.sendAT("+SGPIO=0,4,1,0");
     modem.waitResponse(2000L);
@@ -271,9 +272,13 @@ void disableGPS() {
 // Test GPS con metodo standard migliorato
 bool testGPSStandard() {
     SerialMon.println("\n--- Tentativo acquisizione GPS ---");
-    
-    // Verifica stato GPS
-    sendATCommand("+CGPS?", 1000);
+
+    // Verifica stato GNSS (usa CGNS per SIM7000G)
+    modem.sendAT("+CGNSPWR?");
+    String pwrStatus = "";
+    if (modem.waitResponse(2000L, pwrStatus) == 1) {
+        SerialMon.println("GNSS Power: " + pwrStatus);
+    }
     
     // Loop di acquisizione
     unsigned long startTime = millis();
