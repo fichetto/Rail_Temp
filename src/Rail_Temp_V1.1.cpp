@@ -7,7 +7,7 @@
 // ===== CONFIGURAZIONE DISPOSITIVO =====
 const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
 const char* APN = "shared.tids.tim.it";            // APN dell'operatore TIM
-const char* FIRMWARE_VERSION = "1.1.9";            // Versione firmware (per OTA)
+const char* FIRMWARE_VERSION = "1.1.10";           // Versione firmware (per OTA)
 // =======================================
 
 // Configurazione pin sensore temperatura
@@ -1351,14 +1351,14 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
     }
 
     // Leggi e scrivi body
-    const int chunkSize = 512;  // Chunk più piccoli per evitare problemi di buffer
+    const int chunkSize = 256;  // Chunk ancora più piccoli
     uint8_t buffer[chunkSize];
     int bytesRead = 0;
     int lastProgress = 0;
     unsigned long lastActivityTime = millis();
     unsigned long lastStatusLog = millis();
-    int stallCount = 0;
-    const int maxStallCount = 100;  // Max cicli senza dati prima di log
+    int emptyReads = 0;
+    const int maxEmptyReads = 1000;  // ~10 secondi di attesa vuota prima di forzare read
 
     while (bytesRead < contentLength) {
         int avail = sslClient.available();
@@ -1378,40 +1378,66 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
                 }
                 bytesRead += actualRead;
                 lastActivityTime = millis();
-                stallCount = 0;
+                emptyReads = 0;
 
-                // Aggiorna progresso ogni 10%
+                // Aggiorna progresso ogni 5%
                 int progress = (bytesRead * 100) / contentLength;
-                if (progress >= lastProgress + 10) {
+                if (progress >= lastProgress + 5) {
                     lastProgress = progress;
                     publishOtaStatus("downloading", progress);
                     SerialMon.printf("Download: %d%% (%d/%d)\n", progress, bytesRead, contentLength);
                 }
             }
-        } else if (!sslClient.connected()) {
-            SerialMon.printf("Connection check: connected=%d, bytesRead=%d\n",
-                             sslClient.connected(), bytesRead);
-            if (bytesRead < contentLength) {
-                lastError = "connection_lost";
-                SerialMon.println("Connection lost during download");
-                Update.abort();
-                xSemaphoreGive(modemMutex);
-                return false;
-            }
-            break;
         } else {
-            // Nessun dato disponibile ma connessione attiva
-            stallCount++;
+            // Nessun dato disponibile
+            emptyReads++;
+
+            // Dopo molti read vuoti, forza una lettura diretta per vedere se ci sono dati
+            if (emptyReads > maxEmptyReads && emptyReads % maxEmptyReads == 0) {
+                // Prova un read diretto (potrebbe sbloccare il buffer)
+                int actualRead = sslClient.read(buffer, 1);
+                if (actualRead > 0) {
+                    Update.write(buffer, actualRead);
+                    bytesRead += actualRead;
+                    lastActivityTime = millis();
+                    emptyReads = 0;
+                    SerialMon.println("Forced read recovered data");
+                } else if (actualRead < 0) {
+                    // Errore di lettura - connessione chiusa
+                    SerialMon.printf("Read error: %d at %d%% (%d/%d)\n",
+                                    actualRead, (bytesRead * 100) / contentLength, bytesRead, contentLength);
+                    if (bytesRead < contentLength) {
+                        lastError = "read_error";
+                        Update.abort();
+                        sslClient.stop();
+                        xSemaphoreGive(modemMutex);
+                        return false;
+                    }
+                    break;
+                }
+            }
 
             // Log periodico durante lo stallo (ogni 30s)
             if (millis() - lastStatusLog > 30000) {
                 lastStatusLog = millis();
-                SerialMon.printf("Waiting for data... %d%% (%d/%d), stalls=%d, connected=%d\n",
+                SerialMon.printf("Waiting... %d%% (%d/%d), empty=%d, conn=%d, avail=%d\n",
                                  (bytesRead * 100) / contentLength, bytesRead, contentLength,
-                                 stallCount, sslClient.connected());
+                                 emptyReads, sslClient.connected(), sslClient.available());
             }
 
-            // Piccolo delay per non saturare la CPU
+            // Verifica se la connessione è ancora attiva
+            if (!sslClient.connected() && sslClient.available() == 0) {
+                SerialMon.printf("Connection closed at %d%% (%d/%d)\n",
+                                (bytesRead * 100) / contentLength, bytesRead, contentLength);
+                if (bytesRead < contentLength) {
+                    lastError = "connection_closed";
+                    Update.abort();
+                    xSemaphoreGive(modemMutex);
+                    return false;
+                }
+                break;
+            }
+
             delay(10);
         }
 
