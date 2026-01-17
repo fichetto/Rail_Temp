@@ -7,7 +7,7 @@
 // ===== CONFIGURAZIONE DISPOSITIVO =====
 const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
 const char* APN = "shared.tids.tim.it";            // APN dell'operatore TIM
-const char* FIRMWARE_VERSION = "1.1.8";            // Versione firmware (per OTA)
+const char* FIRMWARE_VERSION = "1.1.9";            // Versione firmware (per OTA)
 // =======================================
 
 // Configurazione pin sensore temperatura
@@ -1351,15 +1351,20 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
     }
 
     // Leggi e scrivi body
-    const int chunkSize = 1024;
+    const int chunkSize = 512;  // Chunk più piccoli per evitare problemi di buffer
     uint8_t buffer[chunkSize];
     int bytesRead = 0;
     int lastProgress = 0;
     unsigned long lastActivityTime = millis();
+    unsigned long lastStatusLog = millis();
+    int stallCount = 0;
+    const int maxStallCount = 100;  // Max cicli senza dati prima di log
 
     while (bytesRead < contentLength) {
-        if (sslClient.available()) {
-            int toRead = min(chunkSize, contentLength - bytesRead);
+        int avail = sslClient.available();
+
+        if (avail > 0) {
+            int toRead = min(chunkSize, min(avail, contentLength - bytesRead));
             int actualRead = sslClient.read(buffer, toRead);
 
             if (actualRead > 0) {
@@ -1373,6 +1378,7 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
                 }
                 bytesRead += actualRead;
                 lastActivityTime = millis();
+                stallCount = 0;
 
                 // Aggiorna progresso ogni 10%
                 int progress = (bytesRead * 100) / contentLength;
@@ -1383,6 +1389,8 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
                 }
             }
         } else if (!sslClient.connected()) {
+            SerialMon.printf("Connection check: connected=%d, bytesRead=%d\n",
+                             sslClient.connected(), bytesRead);
             if (bytesRead < contentLength) {
                 lastError = "connection_lost";
                 SerialMon.println("Connection lost during download");
@@ -1391,12 +1399,27 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
                 return false;
             }
             break;
+        } else {
+            // Nessun dato disponibile ma connessione attiva
+            stallCount++;
+
+            // Log periodico durante lo stallo (ogni 30s)
+            if (millis() - lastStatusLog > 30000) {
+                lastStatusLog = millis();
+                SerialMon.printf("Waiting for data... %d%% (%d/%d), stalls=%d, connected=%d\n",
+                                 (bytesRead * 100) / contentLength, bytesRead, contentLength,
+                                 stallCount, sslClient.connected());
+            }
+
+            // Piccolo delay per non saturare la CPU
+            delay(10);
         }
 
         // Timeout check (180s per reti LTE-M/NB-IoT lente)
         if (millis() - lastActivityTime > 180000) {
             lastError = "download_timeout";
-            SerialMon.println("Download timeout");
+            SerialMon.printf("Download timeout at %d%% (%d/%d)\n",
+                            (bytesRead * 100) / contentLength, bytesRead, contentLength);
             Update.abort();
             sslClient.stop();
             xSemaphoreGive(modemMutex);
@@ -1404,7 +1427,6 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
         }
 
         yield();
-        delay(1);
     }
 
     sslClient.stop();
