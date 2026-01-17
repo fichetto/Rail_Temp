@@ -7,7 +7,7 @@
 // ===== CONFIGURAZIONE DISPOSITIVO =====
 const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
 const char* APN = "shared.tids.tim.it";            // APN dell'operatore TIM
-const char* FIRMWARE_VERSION = "1.1.6";            // Versione firmware (per OTA)
+const char* FIRMWARE_VERSION = "1.1.7";            // Versione firmware (per OTA)
 // =======================================
 
 // Configurazione pin sensore temperatura
@@ -1529,9 +1529,15 @@ void setup() {
 // Loop principale
 void loop() {
     ConnectTask();
+
+    // Processa messaggi MQTT in arrivo (CRITICO per ricevere comandi OTA)
+    if (mqtt.connected()) {
+        mqtt.loop();
+    }
+
     SendMqttDataTask();
     logConnectionStats();
-    
+
     // Indicazione LED dello stato
     static unsigned long lastBlink = 0;
     
