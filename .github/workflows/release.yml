@@ -1,0 +1,82 @@
+name: Build and Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install PlatformIO
+      run: |
+        python -m pip install --upgrade pip
+        pip install platformio
+
+    - name: Build firmware
+      run: |
+        platformio run --environment lilygo_t_sim7000g
+
+    - name: Get version from tag
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+    - name: Calculate checksum
+      id: checksum
+      run: |
+        CHECKSUM=$(sha256sum .pio/build/lilygo_t_sim7000g/firmware.bin | cut -d' ' -f1)
+        echo "SHA256=${CHECKSUM}" >> $GITHUB_OUTPUT
+        echo "Checksum: ${CHECKSUM}"
+
+    - name: Create version.json
+      run: |
+        cat > version.json << EOF
+        {
+          "version": "${{ steps.get_version.outputs.VERSION }}",
+          "url": "https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/firmware.bin",
+          "checksum": "sha256:${{ steps.checksum.outputs.SHA256 }}",
+          "min_battery": 3.8,
+          "release_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        }
+        EOF
+        cat version.json
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        name: Release ${{ steps.get_version.outputs.VERSION }}
+        body: |
+          ## Firmware Release ${{ steps.get_version.outputs.VERSION }}
+
+          ### Download
+          - **firmware.bin** - Binary file for OTA update
+          - **version.json** - Metadata file with checksum
+
+          ### OTA Update Command
+          Publish to MQTT topic `Railtemp03/cmd/ota`:
+          ```json
+          {
+            "url": "https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/firmware.bin",
+            "checksum": "sha256:${{ steps.checksum.outputs.SHA256 }}"
+          }
+          ```
+
+          ### Checksum
+          SHA256: `${{ steps.checksum.outputs.SHA256 }}`
+        files: |
+          .pio/build/lilygo_t_sim7000g/firmware.bin
+          version.json
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
