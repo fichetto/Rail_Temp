@@ -7,7 +7,7 @@
 // ===== CONFIGURAZIONE DISPOSITIVO =====
 const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
 const char* APN = "shared.tids.tim.it";            // APN dell'operatore TIM
-const char* FIRMWARE_VERSION = "1.1.2";            // Versione firmware (per OTA)
+const char* FIRMWARE_VERSION = "1.1.6";            // Versione firmware (per OTA)
 // =======================================
 
 // Configurazione pin sensore temperatura
@@ -20,7 +20,7 @@ DallasTemperature sensors(&oneWire);
 #define SerialAT Serial1
 
 // Configurazione modem GSM
-#define TINY_GSM_MODEM_SIM7000
+#define TINY_GSM_MODEM_SIM7000  // Usa versione standard (SSL via SSLClient)
 #define TINY_GSM_RX_BUFFER 1024
 #define GSM_PIN ""
 
@@ -49,6 +49,7 @@ DallasTemperature sensors(&oneWire);
 #define GPS_TASK_PRIORITY 1             // Priorità task GPS (bassa)
 
 #include <TinyGsmClient.h>
+#include <SSLClient.h>
 #include <PubSubClient.h>
 #include <Update.h>
 #include <ArduinoJson.h>
@@ -1164,9 +1165,9 @@ void performOtaUpdate() {
     }
 }
 
-// Scarica firmware via HTTP usando AT commands del SIM7000G e scrive nella partizione OTA
+// Scarica firmware via SSLClient (SSL software con mbedtls)
 bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
-    SerialMon.println("Starting HTTP download...");
+    SerialMon.println("Starting HTTPS download via SSLClient...");
     SerialMon.println(url);
 
     // Prendi mutex modem
@@ -1175,163 +1176,241 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
         return false;
     }
 
-    // Configura DNS manualmente (risolve errore 603 DNS Error)
-    SerialMon.println("Configuring DNS servers...");
-    modem.sendAT("+CDNSCFG=\"8.8.8.8\",\"8.8.4.4\"");
-    modem.waitResponse(2000L);
+    String urlStr = String(url);
+    bool isHttps = urlStr.startsWith("https://");
 
-    // Inizializza HTTP
-    modem.sendAT("+HTTPTERM");  // Termina sessione precedente se esiste
-    modem.waitResponse(1000L);
+    // Parse URL
+    int startIdx = urlStr.indexOf("://") + 3;
+    int pathIdx = urlStr.indexOf("/", startIdx);
+    if (pathIdx < 0) pathIdx = urlStr.length();
 
-    modem.sendAT("+HTTPINIT");
-    if (modem.waitResponse(10000L) != 1) {
-        lastError = "http_init_failed";
-        xSemaphoreGive(modemMutex);
-        return false;
-    }
+    String host = urlStr.substring(startIdx, pathIdx);
+    String path = urlStr.substring(pathIdx);
+    if (path.length() == 0) path = "/";
+    int port = isHttps ? 443 : 80;
 
-    // Imposta parametri HTTP
-    modem.sendAT("+HTTPPARA=\"CID\",1");
-    modem.waitResponse(1000L);
+    SerialMon.println("Host: " + host);
+    SerialMon.println("Path: " + path);
+    SerialMon.printf("Port: %d, HTTPS: %s\n", port, isHttps ? "YES" : "NO");
 
-    // Imposta URL
-    String urlCmd = "+HTTPPARA=\"URL\",\"" + String(url) + "\"";
-    modem.sendAT(urlCmd.c_str());
-    if (modem.waitResponse(5000L) != 1) {
-        lastError = "http_url_failed";
-        modem.sendAT("+HTTPTERM");
-        modem.waitResponse(1000L);
-        xSemaphoreGive(modemMutex);
-        return false;
-    }
+    // Crea client TCP base
+    TinyGsmClient gsmTransport(modem);
 
-    // Imposta timeout e redirect
-    modem.sendAT("+HTTPPARA=\"REDIR\",1");
-    modem.waitResponse(1000L);
-    modem.sendAT("+HTTPPARA=\"TIMEOUT\",120");
-    modem.waitResponse(1000L);
+    // Wrap con SSLClient per HTTPS (SSL software via mbedtls)
+    SSLClient sslClient(&gsmTransport);
+    sslClient.setInsecure();  // Skip certificate validation (GitHub usa certificati validi)
 
-    // Esegui GET
-    SerialMon.println("Executing HTTP GET...");
-    modem.sendAT("+HTTPACTION=0");
+    SerialMon.println("Connecting to server via SSLClient...");
 
-    // Attendi risposta (timeout lungo per download)
-    String response = "";
-    int result = modem.waitResponse(180000L, response);  // 3 minuti timeout
-
-    if (result != 1) {
-        lastError = "http_action_timeout";
-        modem.sendAT("+HTTPTERM");
-        modem.waitResponse(1000L);
-        xSemaphoreGive(modemMutex);
-        return false;
-    }
-
-    // Aspetta +HTTPACTION: 0,200,size
-    delay(1000);
-    modem.sendAT("+HTTPREAD?");
-    response = "";
-    modem.waitResponse(5000L, response);
-    SerialMon.println("HTTP Response: " + response);
-
-    // Parse content length da +HTTPREAD: LEN,xxx
+    // Per GitHub, dobbiamo seguire i redirect
+    String currentHost = host;
+    String currentPath = path;
+    int currentPort = port;
+    int redirectCount = 0;
+    const int maxRedirects = 5;
     int contentLength = 0;
-    int lenPos = response.indexOf("LEN,");
-    if (lenPos >= 0) {
-        contentLength = response.substring(lenPos + 4).toInt();
+
+    while (redirectCount < maxRedirects) {
+        SerialMon.printf("Attempt %d: %s:%d%s\n", redirectCount + 1, currentHost.c_str(), currentPort, currentPath.c_str());
+
+        if (!sslClient.connect(currentHost.c_str(), currentPort)) {
+            lastError = "connection_failed";
+            SerialMon.println("Connection failed!");
+            xSemaphoreGive(modemMutex);
+            return false;
+        }
+
+        SerialMon.println("Connected! Sending HTTP request...");
+
+        // Invia richiesta HTTP
+        sslClient.print("GET ");
+        sslClient.print(currentPath);
+        sslClient.println(" HTTP/1.1");
+        sslClient.print("Host: ");
+        sslClient.println(currentHost);
+        sslClient.println("User-Agent: ESP32-SIM7000G-OTA");
+        sslClient.println("Accept: */*");
+        sslClient.println("Connection: close");
+        sslClient.println();
+
+        // Leggi risposta header
+        String statusLine = "";
+        unsigned long timeout = millis() + 30000;
+
+        while (sslClient.connected() && millis() < timeout) {
+            if (sslClient.available()) {
+                statusLine = sslClient.readStringUntil('\n');
+                statusLine.trim();
+                break;
+            }
+            delay(10);
+        }
+
+        SerialMon.println("Status: " + statusLine);
+
+        // Parse HTTP status code
+        int httpCode = 0;
+        int spaceIdx = statusLine.indexOf(' ');
+        if (spaceIdx > 0) {
+            httpCode = statusLine.substring(spaceIdx + 1, spaceIdx + 4).toInt();
+        }
+
+        // Leggi headers
+        contentLength = 0;
+        String location = "";
+
+        while (sslClient.connected() && millis() < timeout) {
+            String line = sslClient.readStringUntil('\n');
+            line.trim();
+
+            if (line.length() == 0) {
+                break;  // Fine headers
+            }
+
+            SerialMon.println("H: " + line);
+
+            if (line.startsWith("Content-Length:") || line.startsWith("content-length:")) {
+                contentLength = line.substring(15).toInt();
+            }
+            if (line.startsWith("Location:") || line.startsWith("location:")) {
+                location = line.substring(9);
+                location.trim();
+            }
+        }
+
+        // Handle redirect
+        if (httpCode == 301 || httpCode == 302 || httpCode == 307 || httpCode == 308) {
+            SerialMon.println("Redirect to: " + location);
+            sslClient.stop();
+
+            if (location.length() == 0) {
+                lastError = "redirect_no_location";
+                xSemaphoreGive(modemMutex);
+                return false;
+            }
+
+            // Parse nuova location
+            if (location.startsWith("http://") || location.startsWith("https://")) {
+                bool newHttps = location.startsWith("https://");
+                int newStartIdx = location.indexOf("://") + 3;
+                int newPathIdx = location.indexOf("/", newStartIdx);
+                if (newPathIdx < 0) newPathIdx = location.length();
+
+                currentHost = location.substring(newStartIdx, newPathIdx);
+                currentPath = location.substring(newPathIdx);
+                if (currentPath.length() == 0) currentPath = "/";
+                currentPort = newHttps ? 443 : 80;
+            } else {
+                // Relative redirect
+                currentPath = location;
+            }
+
+            redirectCount++;
+            delay(1000);
+            continue;
+        }
+
+        if (httpCode != 200) {
+            lastError = "http_error_" + String(httpCode);
+            SerialMon.printf("HTTP error: %d\n", httpCode);
+            sslClient.stop();
+            xSemaphoreGive(modemMutex);
+            return false;
+        }
+
+        // HTTP 200 OK - procedi con download
+        break;
     }
+
+    if (redirectCount >= maxRedirects) {
+        lastError = "too_many_redirects";
+        xSemaphoreGive(modemMutex);
+        return false;
+    }
+
+    SerialMon.printf("HTTP 200 OK, Content-Length: %d\n", contentLength);
 
     if (contentLength <= 0) {
-        // Prova altro metodo
-        modem.sendAT("+HTTPHEAD");
-        response = "";
-        modem.waitResponse(5000L, response);
-        SerialMon.println("HTTP Headers: " + response);
-
-        lastError = "invalid_content_length";
-        modem.sendAT("+HTTPTERM");
-        modem.waitResponse(1000L);
+        // Prova a leggere chunked transfer
+        lastError = "no_content_length";
+        SerialMon.println("Warning: No Content-Length header");
+        sslClient.stop();
         xSemaphoreGive(modemMutex);
         return false;
     }
 
-    SerialMon.printf("Content length: %d bytes\n", contentLength);
     publishOtaStatus("downloading", 5);
 
     // Inizia Update
     if (!Update.begin(contentLength)) {
         lastError = "update_begin_failed";
         SerialMon.println("Update.begin() failed");
-        modem.sendAT("+HTTPTERM");
-        modem.waitResponse(1000L);
+        sslClient.stop();
         xSemaphoreGive(modemMutex);
         return false;
     }
 
-    // Leggi e scrivi in chunks
+    // Leggi e scrivi body
     const int chunkSize = 1024;
+    uint8_t buffer[chunkSize];
     int bytesRead = 0;
     int lastProgress = 0;
-    uint8_t buffer[chunkSize];
+    unsigned long lastActivityTime = millis();
 
     while (bytesRead < contentLength) {
-        int toRead = min(chunkSize, contentLength - bytesRead);
+        if (sslClient.available()) {
+            int toRead = min(chunkSize, contentLength - bytesRead);
+            int actualRead = sslClient.read(buffer, toRead);
 
-        // Richiedi chunk
-        String readCmd = "+HTTPREAD=" + String(bytesRead) + "," + String(toRead);
-        modem.sendAT(readCmd.c_str());
+            if (actualRead > 0) {
+                size_t written = Update.write(buffer, actualRead);
+                if (written != (size_t)actualRead) {
+                    lastError = "update_write_failed";
+                    Update.abort();
+                    sslClient.stop();
+                    xSemaphoreGive(modemMutex);
+                    return false;
+                }
+                bytesRead += actualRead;
+                lastActivityTime = millis();
 
-        // Attendi +HTTPREAD: size
-        response = "";
-        if (modem.waitResponse(30000L, response) != 1) {
-            lastError = "http_read_failed";
+                // Aggiorna progresso ogni 10%
+                int progress = (bytesRead * 100) / contentLength;
+                if (progress >= lastProgress + 10) {
+                    lastProgress = progress;
+                    publishOtaStatus("downloading", progress);
+                    SerialMon.printf("Download: %d%% (%d/%d)\n", progress, bytesRead, contentLength);
+                }
+            }
+        } else if (!sslClient.connected()) {
+            if (bytesRead < contentLength) {
+                lastError = "connection_lost";
+                SerialMon.println("Connection lost during download");
+                Update.abort();
+                xSemaphoreGive(modemMutex);
+                return false;
+            }
+            break;
+        }
+
+        // Timeout check
+        if (millis() - lastActivityTime > 60000) {
+            lastError = "download_timeout";
+            SerialMon.println("Download timeout");
             Update.abort();
-            modem.sendAT("+HTTPTERM");
-            modem.waitResponse(1000L);
+            sslClient.stop();
             xSemaphoreGive(modemMutex);
             return false;
         }
 
-        // Leggi dati binari dalla seriale
-        int actualRead = 0;
-        unsigned long startWait = millis();
-        while (actualRead < toRead && millis() - startWait < 10000) {
-            if (SerialAT.available()) {
-                buffer[actualRead++] = SerialAT.read();
-            }
-        }
-
-        if (actualRead > 0) {
-            size_t written = Update.write(buffer, actualRead);
-            if (written != actualRead) {
-                lastError = "update_write_failed";
-                Update.abort();
-                modem.sendAT("+HTTPTERM");
-                modem.waitResponse(1000L);
-                xSemaphoreGive(modemMutex);
-                return false;
-            }
-            bytesRead += actualRead;
-        }
-
-        // Aggiorna progresso ogni 10%
-        int progress = (bytesRead * 100) / contentLength;
-        if (progress >= lastProgress + 10) {
-            lastProgress = progress;
-            publishOtaStatus("downloading", progress);
-            SerialMon.printf("Download progress: %d%%\n", progress);
-        }
-
-        // Yield per watchdog
         yield();
+        delay(1);
     }
 
-    // Termina HTTP
-    modem.sendAT("+HTTPTERM");
-    modem.waitResponse(1000L);
+    sslClient.stop();
     xSemaphoreGive(modemMutex);
 
+    SerialMon.printf("Download complete: %d bytes\n", bytesRead);
     publishOtaStatus("verifying");
 
     // Finalizza update
@@ -1340,10 +1419,6 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
         SerialMon.println("Update.end() failed");
         return false;
     }
-
-    // Verifica checksum (se fornito)
-    // Nota: ESP32 Update non supporta checksum nativo, qui verificheremmo manualmente
-    // Per ora assumiamo success se Update.end() ha successo
 
     SerialMon.println("Update completed successfully!");
     return true;
