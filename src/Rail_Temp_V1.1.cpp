@@ -7,7 +7,7 @@
 // ===== CONFIGURAZIONE DISPOSITIVO =====
 const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
 const char* APN = "shared.tids.tim.it";            // APN dell'operatore TIM
-const char* FIRMWARE_VERSION = "1.1.10";           // Versione firmware (per OTA)
+const char* FIRMWARE_VERSION = "1.1.11";           // Versione firmware (per OTA)
 // =======================================
 
 // Configurazione pin sensore temperatura
@@ -1165,9 +1165,109 @@ void performOtaUpdate() {
     }
 }
 
-// Scarica firmware via SSLClient (SSL software con mbedtls)
+// Helper: Scarica un chunk dal CDN usando HTTP Range
+bool downloadChunk(const char* host, const char* path, int port,
+                   int rangeStart, int rangeEnd, int* bytesDownloaded) {
+    TinyGsmClient gsmTransport(modem);
+    SSLClient sslClient(&gsmTransport);
+    sslClient.setInsecure();
+
+    SerialMon.printf("Chunk %d-%d from %s\n", rangeStart, rangeEnd, host);
+
+    if (!sslClient.connect(host, port)) {
+        SerialMon.println("Chunk connection failed");
+        return false;
+    }
+
+    // Invia richiesta con Range header
+    sslClient.print("GET ");
+    sslClient.print(path);
+    sslClient.println(" HTTP/1.1");
+    sslClient.print("Host: ");
+    sslClient.println(host);
+    sslClient.println("User-Agent: ESP32-SIM7000G-OTA");
+    sslClient.print("Range: bytes=");
+    sslClient.print(rangeStart);
+    sslClient.print("-");
+    sslClient.println(rangeEnd);
+    sslClient.println("Connection: close");
+    sslClient.println();
+
+    // Leggi status line
+    unsigned long timeout = millis() + 30000;
+    String statusLine = "";
+    while (sslClient.connected() && millis() < timeout) {
+        if (sslClient.available()) {
+            statusLine = sslClient.readStringUntil('\n');
+            statusLine.trim();
+            break;
+        }
+        delay(10);
+    }
+
+    int httpCode = 0;
+    int spaceIdx = statusLine.indexOf(' ');
+    if (spaceIdx > 0) {
+        httpCode = statusLine.substring(spaceIdx + 1, spaceIdx + 4).toInt();
+    }
+
+    // Skip headers
+    while (sslClient.connected() && millis() < timeout) {
+        String line = sslClient.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) break;
+    }
+
+    if (httpCode != 206 && httpCode != 200) {
+        SerialMon.printf("Chunk HTTP error: %d\n", httpCode);
+        sslClient.stop();
+        return false;
+    }
+
+    // Leggi body
+    const int bufSize = 256;
+    uint8_t buffer[bufSize];
+    int chunkBytes = 0;
+    int expectedBytes = rangeEnd - rangeStart + 1;
+    unsigned long lastActivity = millis();
+
+    while (chunkBytes < expectedBytes) {
+        int avail = sslClient.available();
+        if (avail > 0) {
+            int toRead = min(bufSize, min(avail, expectedBytes - chunkBytes));
+            int actualRead = sslClient.read(buffer, toRead);
+            if (actualRead > 0) {
+                size_t written = Update.write(buffer, actualRead);
+                if (written != (size_t)actualRead) {
+                    SerialMon.println("Update.write failed in chunk");
+                    sslClient.stop();
+                    return false;
+                }
+                chunkBytes += actualRead;
+                lastActivity = millis();
+            }
+        } else if (!sslClient.connected()) {
+            break;
+        }
+
+        if (millis() - lastActivity > 60000) {
+            SerialMon.println("Chunk timeout");
+            sslClient.stop();
+            return false;
+        }
+        yield();
+        delay(1);
+    }
+
+    sslClient.stop();
+    *bytesDownloaded = chunkBytes;
+    SerialMon.printf("Chunk done: %d bytes\n", chunkBytes);
+    return true;
+}
+
+// Scarica firmware via SSLClient con chunked download (HTTP Range)
 bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
-    SerialMon.println("Starting HTTPS download via SSLClient...");
+    SerialMon.println("Starting chunked HTTPS download...");
     SerialMon.println(url);
 
     // Prendi mutex modem
@@ -1191,18 +1291,12 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
 
     SerialMon.println("Host: " + host);
     SerialMon.println("Path: " + path);
-    SerialMon.printf("Port: %d, HTTPS: %s\n", port, isHttps ? "YES" : "NO");
 
-    // Crea client TCP base
+    // Prima richiesta: segui redirect e ottieni Content-Length
     TinyGsmClient gsmTransport(modem);
-
-    // Wrap con SSLClient per HTTPS (SSL software via mbedtls)
     SSLClient sslClient(&gsmTransport);
-    sslClient.setInsecure();  // Skip certificate validation (GitHub usa certificati validi)
+    sslClient.setInsecure();
 
-    SerialMon.println("Connecting to server via SSLClient...");
-
-    // Per GitHub, dobbiamo seguire i redirect
     String currentHost = host;
     String currentPath = path;
     int currentPort = port;
@@ -1211,32 +1305,26 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
     int contentLength = 0;
 
     while (redirectCount < maxRedirects) {
-        SerialMon.printf("Attempt %d: %s:%d%s\n", redirectCount + 1, currentHost.c_str(), currentPort, currentPath.c_str());
+        SerialMon.printf("Redirect %d: %s:%d%s\n", redirectCount, currentHost.c_str(), currentPort, currentPath.c_str());
 
         if (!sslClient.connect(currentHost.c_str(), currentPort)) {
             lastError = "connection_failed";
-            SerialMon.println("Connection failed!");
             xSemaphoreGive(modemMutex);
             return false;
         }
 
-        SerialMon.println("Connected! Sending HTTP request...");
-
-        // Invia richiesta HTTP
-        sslClient.print("GET ");
+        // HEAD request per ottenere info senza scaricare
+        sslClient.print("HEAD ");
         sslClient.print(currentPath);
         sslClient.println(" HTTP/1.1");
         sslClient.print("Host: ");
         sslClient.println(currentHost);
         sslClient.println("User-Agent: ESP32-SIM7000G-OTA");
-        sslClient.println("Accept: */*");
         sslClient.println("Connection: close");
         sslClient.println();
 
-        // Leggi risposta header
-        String statusLine = "";
         unsigned long timeout = millis() + 30000;
-
+        String statusLine = "";
         while (sslClient.connected() && millis() < timeout) {
             if (sslClient.available()) {
                 statusLine = sslClient.readStringUntil('\n');
@@ -1246,28 +1334,17 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
             delay(10);
         }
 
-        SerialMon.println("Status: " + statusLine);
-
-        // Parse HTTP status code
         int httpCode = 0;
         int spaceIdx = statusLine.indexOf(' ');
         if (spaceIdx > 0) {
             httpCode = statusLine.substring(spaceIdx + 1, spaceIdx + 4).toInt();
         }
 
-        // Leggi headers
-        contentLength = 0;
         String location = "";
-
         while (sslClient.connected() && millis() < timeout) {
             String line = sslClient.readStringUntil('\n');
             line.trim();
-
-            if (line.length() == 0) {
-                break;  // Fine headers
-            }
-
-            SerialMon.println("H: " + line);
+            if (line.length() == 0) break;
 
             if (line.startsWith("Content-Length:") || line.startsWith("content-length:")) {
                 contentLength = line.substring(15).toInt();
@@ -1278,18 +1355,16 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
             }
         }
 
-        // Handle redirect
+        sslClient.stop();
+
         if (httpCode == 301 || httpCode == 302 || httpCode == 307 || httpCode == 308) {
             SerialMon.println("Redirect to: " + location);
-            sslClient.stop();
-
             if (location.length() == 0) {
                 lastError = "redirect_no_location";
                 xSemaphoreGive(modemMutex);
                 return false;
             }
 
-            // Parse nuova location
             if (location.startsWith("http://") || location.startsWith("https://")) {
                 bool newHttps = location.startsWith("https://");
                 int newStartIdx = location.indexOf("://") + 3;
@@ -1301,26 +1376,24 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
                 if (currentPath.length() == 0) currentPath = "/";
                 currentPort = newHttps ? 443 : 80;
             } else {
-                // Relative redirect
                 currentPath = location;
             }
 
             redirectCount++;
-            delay(1000);
+            delay(500);
             continue;
         }
 
         if (httpCode != 200) {
             lastError = "http_error_" + String(httpCode);
-            SerialMon.printf("HTTP error: %d\n", httpCode);
-            sslClient.stop();
             xSemaphoreGive(modemMutex);
             return false;
         }
 
-        // HTTP 200 OK - procedi con download
         break;
     }
+
+    SerialMon.printf("Total size: %d bytes\n", contentLength);
 
     if (redirectCount >= maxRedirects) {
         lastError = "too_many_redirects";
@@ -1328,137 +1401,80 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
         return false;
     }
 
-    SerialMon.printf("HTTP 200 OK, Content-Length: %d\n", contentLength);
-
     if (contentLength <= 0) {
-        // Prova a leggere chunked transfer
         lastError = "no_content_length";
         SerialMon.println("Warning: No Content-Length header");
-        sslClient.stop();
         xSemaphoreGive(modemMutex);
         return false;
     }
 
-    publishOtaStatus("downloading", 5);
+    publishOtaStatus("downloading", 0);
 
     // Inizia Update
     if (!Update.begin(contentLength)) {
         lastError = "update_begin_failed";
         SerialMon.println("Update.begin() failed");
-        sslClient.stop();
         xSemaphoreGive(modemMutex);
         return false;
     }
 
-    // Leggi e scrivi body
-    const int chunkSize = 256;  // Chunk ancora più piccoli
-    uint8_t buffer[chunkSize];
-    int bytesRead = 0;
-    int lastProgress = 0;
-    unsigned long lastActivityTime = millis();
-    unsigned long lastStatusLog = millis();
-    int emptyReads = 0;
-    const int maxEmptyReads = 1000;  // ~10 secondi di attesa vuota prima di forzare read
+    // Download in chunk da 500KB per evitare timeout della connessione
+    const int CHUNK_SIZE = 500000;  // 500KB per chunk
+    int totalBytesRead = 0;
+    int chunkNumber = 0;
+    int lastProgress = -1;
+    const int maxRetries = 3;
 
-    while (bytesRead < contentLength) {
-        int avail = sslClient.available();
+    // Salva host e path del CDN per i chunk
+    char cdnHost[256];
+    char cdnPath[512];
+    strncpy(cdnHost, currentHost.c_str(), sizeof(cdnHost) - 1);
+    strncpy(cdnPath, currentPath.c_str(), sizeof(cdnPath) - 1);
 
-        if (avail > 0) {
-            int toRead = min(chunkSize, min(avail, contentLength - bytesRead));
-            int actualRead = sslClient.read(buffer, toRead);
+    while (totalBytesRead < contentLength) {
+        int rangeStart = totalBytesRead;
+        int rangeEnd = min(totalBytesRead + CHUNK_SIZE - 1, contentLength - 1);
 
-            if (actualRead > 0) {
-                size_t written = Update.write(buffer, actualRead);
-                if (written != (size_t)actualRead) {
-                    lastError = "update_write_failed";
-                    Update.abort();
-                    sslClient.stop();
-                    xSemaphoreGive(modemMutex);
-                    return false;
-                }
-                bytesRead += actualRead;
-                lastActivityTime = millis();
-                emptyReads = 0;
+        bool chunkSuccess = false;
+        int retries = 0;
 
-                // Aggiorna progresso ogni 5%
-                int progress = (bytesRead * 100) / contentLength;
-                if (progress >= lastProgress + 5) {
+        while (!chunkSuccess && retries < maxRetries) {
+            int chunkBytesRead = 0;
+            chunkSuccess = downloadChunk(cdnHost, cdnPath, currentPort,
+                                        rangeStart, rangeEnd, &chunkBytesRead);
+
+            if (chunkSuccess && chunkBytesRead > 0) {
+                totalBytesRead += chunkBytesRead;
+
+                // Aggiorna progresso
+                int progress = (totalBytesRead * 100) / contentLength;
+                if (progress != lastProgress) {
                     lastProgress = progress;
                     publishOtaStatus("downloading", progress);
-                    SerialMon.printf("Download: %d%% (%d/%d)\n", progress, bytesRead, contentLength);
+                    SerialMon.printf("Progress: %d%% (%d/%d)\n", progress, totalBytesRead, contentLength);
                 }
+            } else {
+                retries++;
+                SerialMon.printf("Chunk %d failed, retry %d/%d\n", chunkNumber, retries, maxRetries);
+                delay(2000);  // Attendi prima di riprovare
             }
-        } else {
-            // Nessun dato disponibile
-            emptyReads++;
-
-            // Dopo molti read vuoti, forza una lettura diretta per vedere se ci sono dati
-            if (emptyReads > maxEmptyReads && emptyReads % maxEmptyReads == 0) {
-                // Prova un read diretto (potrebbe sbloccare il buffer)
-                int actualRead = sslClient.read(buffer, 1);
-                if (actualRead > 0) {
-                    Update.write(buffer, actualRead);
-                    bytesRead += actualRead;
-                    lastActivityTime = millis();
-                    emptyReads = 0;
-                    SerialMon.println("Forced read recovered data");
-                } else if (actualRead < 0) {
-                    // Errore di lettura - connessione chiusa
-                    SerialMon.printf("Read error: %d at %d%% (%d/%d)\n",
-                                    actualRead, (bytesRead * 100) / contentLength, bytesRead, contentLength);
-                    if (bytesRead < contentLength) {
-                        lastError = "read_error";
-                        Update.abort();
-                        sslClient.stop();
-                        xSemaphoreGive(modemMutex);
-                        return false;
-                    }
-                    break;
-                }
-            }
-
-            // Log periodico durante lo stallo (ogni 30s)
-            if (millis() - lastStatusLog > 30000) {
-                lastStatusLog = millis();
-                SerialMon.printf("Waiting... %d%% (%d/%d), empty=%d, conn=%d, avail=%d\n",
-                                 (bytesRead * 100) / contentLength, bytesRead, contentLength,
-                                 emptyReads, sslClient.connected(), sslClient.available());
-            }
-
-            // Verifica se la connessione è ancora attiva
-            if (!sslClient.connected() && sslClient.available() == 0) {
-                SerialMon.printf("Connection closed at %d%% (%d/%d)\n",
-                                (bytesRead * 100) / contentLength, bytesRead, contentLength);
-                if (bytesRead < contentLength) {
-                    lastError = "connection_closed";
-                    Update.abort();
-                    xSemaphoreGive(modemMutex);
-                    return false;
-                }
-                break;
-            }
-
-            delay(10);
         }
 
-        // Timeout check (180s per reti LTE-M/NB-IoT lente)
-        if (millis() - lastActivityTime > 180000) {
-            lastError = "download_timeout";
-            SerialMon.printf("Download timeout at %d%% (%d/%d)\n",
-                            (bytesRead * 100) / contentLength, bytesRead, contentLength);
+        if (!chunkSuccess) {
+            lastError = "chunk_download_failed";
+            SerialMon.printf("Failed to download chunk %d after %d retries\n", chunkNumber, maxRetries);
             Update.abort();
-            sslClient.stop();
             xSemaphoreGive(modemMutex);
             return false;
         }
 
-        yield();
+        chunkNumber++;
+        delay(500);  // Breve pausa tra i chunk
     }
 
-    sslClient.stop();
     xSemaphoreGive(modemMutex);
 
-    SerialMon.printf("Download complete: %d bytes\n", bytesRead);
+    SerialMon.printf("Download complete: %d bytes in %d chunks\n", totalBytesRead, chunkNumber);
     publishOtaStatus("verifying");
 
     // Finalizza update
