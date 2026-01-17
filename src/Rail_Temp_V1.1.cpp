@@ -640,6 +640,14 @@ void ConnectTask() {
     
     if (millis() - connManager.totalConnectionTime > connManager.MAX_TOTAL_TIME) {
         SerialMon.println("Total connection time exceeded - deep sleep");
+        float v = readBatteryVoltage();
+        if (v < 0.5) {
+            // USB powered - skip deep sleep e resetta timer per evitare loop
+            SerialMon.println("USB powered - resetting connection timer");
+            connManager.totalConnectionTime = 0;
+            connManager.attemptCount = 0;
+            return;
+        }
         goToDeepSleep(TIME_TO_SLEEP_LOW_BATTERY);
         return;
     }
