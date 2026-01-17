@@ -573,38 +573,42 @@ bool initializeModem() {
 // Connessione alla rete con timeout progressivi
 bool connectToNetwork() {
     SerialMon.println("Connecting to network...");
-    
+
     int baseTimeout = 30;
     int additionalTimeout = connManager.attemptCount * 10;
     int maxWaitTime = baseTimeout + additionalTimeout;
-    
+
     SerialMon.printf("Network timeout: %d seconds\n", maxWaitTime);
-    
+
     if (connManager.attemptCount > 1) {
         modem.sendAT("+COPS=0");
         modem.waitResponse(60000L);
         delay(5000);
     }
-    
+
     unsigned long startTime = millis();
     while (millis() - startTime < (maxWaitTime * 1000UL)) {
         int signal = modem.getSignalQuality();
-        
-        if (signal != 99 && signal > 0) {
-            SerialMon.printf("Network connected! Signal: %d\n", signal);
+        bool registered = modem.isNetworkConnected();
+
+        // Verifica REGISTRAZIONE alla rete, non solo segnale
+        if (registered && signal != 99 && signal > 0) {
+            SerialMon.printf("Network registered! Signal: %d\n", signal);
             SerialMon.println("Operator: " + modem.getOperator());
             return true;
         }
-        
+
         if ((millis() - startTime) % 5000 < 100) {
-            SerialMon.printf("Waiting... Signal: %d, Time: %lds/%ds\n", 
-                           signal, (millis() - startTime) / 1000, maxWaitTime);
+            SerialMon.printf("Waiting... Signal: %d, Registered: %s, Time: %lds/%ds\n",
+                           signal, registered ? "YES" : "NO",
+                           (millis() - startTime) / 1000, maxWaitTime);
         }
-        
+
         delay(1000);
         digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     }
-    
+
+    SerialMon.println("Network registration timeout");
     return false;
 }
 
@@ -625,9 +629,18 @@ bool connectToGPRS() {
 
 // Gestione connessione con backoff progressivo
 void ConnectTask() {
-    if (connectionOK && modem.isGprsConnected()) {
-        if (!modem.isNetworkConnected() || !modem.isGprsConnected()) {
-            SerialMon.println("Connection lost");
+    // Se già connessi, verifica che la connessione sia ancora attiva
+    if (connectionOK) {
+        // Usa mutex per evitare conflitti con GPS task
+        bool gprsOk = true;
+        if (modemMutex != NULL && xSemaphoreTake(modemMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            gprsOk = modem.isGprsConnected();
+            xSemaphoreGive(modemMutex);
+        }
+        // Se non riusciamo a prendere il mutex, assumiamo connessione OK (modem occupato)
+
+        if (!gprsOk) {
+            SerialMon.println("Connection lost - GPRS disconnected");
             connectionOK = false;
             connManager.reset();
         }
