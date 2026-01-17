@@ -7,7 +7,7 @@
 // ===== CONFIGURAZIONE DISPOSITIVO =====
 const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
 const char* APN = "shared.tids.tim.it";            // APN dell'operatore TIM
-const char* FIRMWARE_VERSION = "1.1.0";            // Versione firmware (per OTA)
+const char* FIRMWARE_VERSION = "1.1.2";            // Versione firmware (per OTA)
 // =======================================
 
 // Configurazione pin sensore temperatura
@@ -1174,6 +1174,11 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
         lastError = "modem_mutex_timeout";
         return false;
     }
+
+    // Configura DNS manualmente (risolve errore 603 DNS Error)
+    SerialMon.println("Configuring DNS servers...");
+    modem.sendAT("+CDNSCFG=\"8.8.8.8\",\"8.8.4.4\"");
+    modem.waitResponse(2000L);
 
     // Inizializza HTTP
     modem.sendAT("+HTTPTERM");  // Termina sessione precedente se esiste
