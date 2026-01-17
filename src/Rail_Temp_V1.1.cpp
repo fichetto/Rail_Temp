@@ -7,7 +7,7 @@
 // ===== CONFIGURAZIONE DISPOSITIVO =====
 const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
 const char* APN = "shared.tids.tim.it";            // APN dell'operatore TIM
-const char* FIRMWARE_VERSION = "1.1.7";            // Versione firmware (per OTA)
+const char* FIRMWARE_VERSION = "1.1.8";            // Versione firmware (per OTA)
 // =======================================
 
 // Configurazione pin sensore temperatura
@@ -1393,8 +1393,8 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
             break;
         }
 
-        // Timeout check
-        if (millis() - lastActivityTime > 60000) {
+        // Timeout check (180s per reti LTE-M/NB-IoT lente)
+        if (millis() - lastActivityTime > 180000) {
             lastError = "download_timeout";
             SerialMon.println("Download timeout");
             Update.abort();
