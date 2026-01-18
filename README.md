@@ -143,4 +143,116 @@ Ecco un elenco di istruzioni per il collaboratore che deve personalizzare questo
 
 Seguendo queste istruzioni, il collaboratore dovrebbe essere in grado di personalizzare efficacemente il firmware per ciascun dispositivo Railtemp, garantendo che ogni unità funzioni correttamente con il proprio identificatore unico e le eventuali configurazioni hardware specifiche.
 
+---
+
+## Funzionalità OTA (Over-The-Air Update) - v1.1.6
+
+A partire dalla versione 1.1.6, il firmware supporta l'aggiornamento remoto via HTTPS attraverso la rete cellulare.
+
+### Caratteristiche principali
+
+- **Download HTTPS sicuro**: Utilizza la libreria SSLClient (mbedtls) per connessioni SSL/TLS
+- **Supporto GitHub Releases**: Scarica firmware direttamente dalle release GitHub
+- **Gestione redirect**: Segue automaticamente i redirect HTTP (301, 302, 307, 308)
+- **Protezione batteria**: Rifiuta l'aggiornamento se la batteria è sotto 3.8V
+- **Feedback MQTT**: Pubblica lo stato dell'aggiornamento in tempo reale
+- **Checksum SHA256**: Verifica l'integrità del firmware (opzionale)
+
+### Topic MQTT per OTA
+
+| Topic | Direzione | Descrizione |
+|-------|-----------|-------------|
+| `{DEVICE_ID}/cmd/ota` | IN | Comando per avviare l'aggiornamento |
+| `{DEVICE_ID}/cmd/reboot` | IN | Comando per riavviare il dispositivo |
+| `{DEVICE_ID}/cmd/diagnostics` | IN | Richiesta diagnostica completa |
+| `{DEVICE_ID}/ota/status` | OUT | Stato dell'aggiornamento OTA |
+| `{DEVICE_ID}/diagnostics` | OUT | Dati diagnostici in formato JSON |
+
+### Formato comando OTA
+
+Pubblica sul topic `{DEVICE_ID}/cmd/ota` un JSON con questa struttura:
+
+```json
+{
+  "url": "https://github.com/user/repo/releases/download/v1.2.0/firmware.bin",
+  "checksum": "sha256:abc123..."
+}
+```
+
+### Utilizzo con GitHub Actions
+
+Il repository include una GitHub Action che automaticamente:
+1. Compila il firmware quando viene creato un tag `v*`
+2. Calcola il checksum SHA256
+3. Crea una release con `firmware.bin` e `version.json`
+
+**Per creare una nuova release:**
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+**Per inviare il comando OTA:**
+
+```bash
+# Usando il CLI tool incluso
+python tools/railtemp_cli.py ota v1.2.0
+
+# Oppure manualmente via MQTT
+mosquitto_pub -h telemetry.tecnocons.com -u tecnocons -P nonserve \
+  -t "Railtemp03/cmd/ota" \
+  -m '{"url":"https://github.com/fichetto/Rail_Temp/releases/download/v1.2.0/firmware.bin","checksum":"sha256:..."}'
+```
+
+### Stati OTA
+
+Durante l'aggiornamento, il dispositivo pubblica su `{DEVICE_ID}/ota/status`:
+
+| Stato | Descrizione |
+|-------|-------------|
+| `starting` | Aggiornamento avviato |
+| `downloading` | Download in corso (con progress %) |
+| `verifying` | Verifica integrità |
+| `success` | Completato con successo |
+| `failed` | Fallito (con messaggio errore) |
+| `rejected` | Rifiutato (batteria bassa, già in corso) |
+
+### Esempio risposta diagnostica
+
+Pubblica qualsiasi messaggio su `{DEVICE_ID}/cmd/diagnostics` per ricevere:
+
+```json
+{
+  "firmware_version": "1.1.6",
+  "device_id": "Railtemp03",
+  "uptime_ms": 123456,
+  "free_heap": 180000,
+  "battery_voltage": 4.12,
+  "signal_quality": 25,
+  "gps_fix": true,
+  "gps_lat": 45.123456,
+  "gps_lon": 9.123456,
+  "temperature_c": 22.5,
+  "mqtt_connected": true,
+  "gprs_connected": true,
+  "last_error": "none",
+  "ota_in_progress": false
+}
+```
+
+### Note tecniche
+
+- **Libreria SSL**: govorox/SSLClient (wrapper mbedtls per ESP32)
+- **Modem**: TinyGSM con TINY_GSM_MODEM_SIM7000 (connessione TCP standard)
+- **Timeout download**: 60 secondi di inattività
+- **Max redirect**: 5 redirect consecutivi
+- **Chunk size**: 1024 bytes per lettura
+
+### Limitazioni note
+
+- Il firmware deve essere ospitato su server HTTPS accessibile
+- Il download richiede una connessione GPRS stabile
+- Su rete LTE-M/NB-IoT la velocità può essere limitata (~10-50 KB/s)
+- Il dispositivo non è raggiungibile durante l'aggiornamento (~5-15 minuti per ~900KB)
 
