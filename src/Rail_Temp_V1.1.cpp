@@ -7,7 +7,37 @@
 // ===== CONFIGURAZIONE DISPOSITIVO =====
 const char* DEVICE_ID = "Railtemp03";              // ID del dispositivo
 const char* APN = "shared.tids.tim.it";            // APN dell'operatore TIM
-const char* FIRMWARE_VERSION = "1.1.11";           // Versione firmware (per OTA)
+const char* FIRMWARE_VERSION = "1.1.12";           // Versione firmware (per OTA)
+
+// Debug flags - commentare per disabilitare log verbosi in produzione
+// #define DEBUG_OTA        // Log dettagliati OTA
+// #define DEBUG_GPS        // Log dettagliati GPS
+// #define DEBUG_CONNECTION // Log dettagliati connessione
+
+// Macro per log condizionali
+#ifdef DEBUG_OTA
+  #define OTA_LOG(x) SerialMon.println(x)
+  #define OTA_LOGF(...) SerialMon.printf(__VA_ARGS__)
+#else
+  #define OTA_LOG(x)
+  #define OTA_LOGF(...)
+#endif
+
+#ifdef DEBUG_GPS
+  #define GPS_LOG(x) SerialMon.println(x)
+  #define GPS_LOGF(...) SerialMon.printf(__VA_ARGS__)
+#else
+  #define GPS_LOG(x)
+  #define GPS_LOGF(...)
+#endif
+
+#ifdef DEBUG_CONNECTION
+  #define CONN_LOG(x) SerialMon.println(x)
+  #define CONN_LOGF(...) SerialMon.printf(__VA_ARGS__)
+#else
+  #define CONN_LOG(x)
+  #define CONN_LOGF(...)
+#endif
 // =======================================
 
 // Configurazione pin sensore temperatura
@@ -159,7 +189,6 @@ struct GPSCache {
 volatile bool otaInProgress = false;
 String otaUrl = "";
 String otaChecksum = "";
-int otaProgress = 0;
 String lastError = "none";
 
 // Dichiarazioni funzioni
@@ -1172,10 +1201,10 @@ bool downloadChunk(const char* host, const char* path, int port,
     SSLClient sslClient(&gsmTransport);
     sslClient.setInsecure();
 
-    SerialMon.printf("Chunk %d-%d from %s\n", rangeStart, rangeEnd, host);
+    OTA_LOGF("Chunk %d-%d from %s\n", rangeStart, rangeEnd, host);
 
     if (!sslClient.connect(host, port)) {
-        SerialMon.println("Chunk connection failed");
+        OTA_LOG("Chunk connection failed");
         return false;
     }
 
@@ -1219,7 +1248,7 @@ bool downloadChunk(const char* host, const char* path, int port,
     }
 
     if (httpCode != 206 && httpCode != 200) {
-        SerialMon.printf("Chunk HTTP error: %d\n", httpCode);
+        OTA_LOGF("Chunk HTTP error: %d\n", httpCode);
         sslClient.stop();
         return false;
     }
@@ -1239,7 +1268,7 @@ bool downloadChunk(const char* host, const char* path, int port,
             if (actualRead > 0) {
                 size_t written = Update.write(buffer, actualRead);
                 if (written != (size_t)actualRead) {
-                    SerialMon.println("Update.write failed in chunk");
+                    OTA_LOG("Update.write failed in chunk");
                     sslClient.stop();
                     return false;
                 }
@@ -1251,7 +1280,7 @@ bool downloadChunk(const char* host, const char* path, int port,
         }
 
         if (millis() - lastActivity > 60000) {
-            SerialMon.println("Chunk timeout");
+            OTA_LOG("Chunk timeout");
             sslClient.stop();
             return false;
         }
@@ -1261,14 +1290,14 @@ bool downloadChunk(const char* host, const char* path, int port,
 
     sslClient.stop();
     *bytesDownloaded = chunkBytes;
-    SerialMon.printf("Chunk done: %d bytes\n", chunkBytes);
+    OTA_LOGF("Chunk done: %d bytes\n", chunkBytes);
     return true;
 }
 
 // Scarica firmware via SSLClient con chunked download (HTTP Range)
 bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
-    SerialMon.println("Starting chunked HTTPS download...");
-    SerialMon.println(url);
+    OTA_LOG("Starting chunked HTTPS download...");
+    OTA_LOG(url);
 
     // Prendi mutex modem
     if (modemMutex == NULL || xSemaphoreTake(modemMutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
@@ -1289,8 +1318,8 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
     if (path.length() == 0) path = "/";
     int port = isHttps ? 443 : 80;
 
-    SerialMon.println("Host: " + host);
-    SerialMon.println("Path: " + path);
+    OTA_LOG("Host: " + host);
+    OTA_LOG("Path: " + path);
 
     // Prima richiesta: segui redirect e ottieni Content-Length
     TinyGsmClient gsmTransport(modem);
@@ -1305,7 +1334,7 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
     int contentLength = 0;
 
     while (redirectCount < maxRedirects) {
-        SerialMon.printf("Redirect %d: %s:%d%s\n", redirectCount, currentHost.c_str(), currentPort, currentPath.c_str());
+        OTA_LOGF("Redirect %d: %s:%d%s\n", redirectCount, currentHost.c_str(), currentPort, currentPath.c_str());
 
         if (!sslClient.connect(currentHost.c_str(), currentPort)) {
             lastError = "connection_failed";
@@ -1358,7 +1387,7 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
         sslClient.stop();
 
         if (httpCode == 301 || httpCode == 302 || httpCode == 307 || httpCode == 308) {
-            SerialMon.println("Redirect to: " + location);
+            OTA_LOG("Redirect to: " + location);
             if (location.length() == 0) {
                 lastError = "redirect_no_location";
                 xSemaphoreGive(modemMutex);
@@ -1393,7 +1422,7 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
         break;
     }
 
-    SerialMon.printf("Total size: %d bytes\n", contentLength);
+    OTA_LOGF("Total size: %d bytes\n", contentLength);
 
     if (redirectCount >= maxRedirects) {
         lastError = "too_many_redirects";
@@ -1403,7 +1432,7 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
 
     if (contentLength <= 0) {
         lastError = "no_content_length";
-        SerialMon.println("Warning: No Content-Length header");
+        OTA_LOG("Warning: No Content-Length header");
         xSemaphoreGive(modemMutex);
         return false;
     }
@@ -1413,7 +1442,7 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
     // Inizia Update
     if (!Update.begin(contentLength)) {
         lastError = "update_begin_failed";
-        SerialMon.println("Update.begin() failed");
+        OTA_LOG("Update.begin() failed");
         xSemaphoreGive(modemMutex);
         return false;
     }
@@ -1446,45 +1475,45 @@ bool httpGetToUpdate(const char* url, const char* expectedChecksum) {
             if (chunkSuccess && chunkBytesRead > 0) {
                 totalBytesRead += chunkBytesRead;
 
-                // Aggiorna progresso
+                // Aggiorna progresso (manteniamo questo log essenziale per monitorare)
                 int progress = (totalBytesRead * 100) / contentLength;
                 if (progress != lastProgress) {
                     lastProgress = progress;
                     publishOtaStatus("downloading", progress);
-                    SerialMon.printf("Progress: %d%% (%d/%d)\n", progress, totalBytesRead, contentLength);
+                    SerialMon.printf("OTA: %d%%\n", progress);  // Log compatto
                 }
             } else {
                 retries++;
-                SerialMon.printf("Chunk %d failed, retry %d/%d\n", chunkNumber, retries, maxRetries);
-                delay(2000);  // Attendi prima di riprovare
+                OTA_LOGF("Chunk %d failed, retry %d/%d\n", chunkNumber, retries, maxRetries);
+                delay(2000);
             }
         }
 
         if (!chunkSuccess) {
             lastError = "chunk_download_failed";
-            SerialMon.printf("Failed to download chunk %d after %d retries\n", chunkNumber, maxRetries);
+            OTA_LOGF("Failed chunk %d after %d retries\n", chunkNumber, maxRetries);
             Update.abort();
             xSemaphoreGive(modemMutex);
             return false;
         }
 
         chunkNumber++;
-        delay(500);  // Breve pausa tra i chunk
+        delay(500);
     }
 
     xSemaphoreGive(modemMutex);
 
-    SerialMon.printf("Download complete: %d bytes in %d chunks\n", totalBytesRead, chunkNumber);
+    SerialMon.printf("OTA complete: %d bytes\n", totalBytesRead);
     publishOtaStatus("verifying");
 
     // Finalizza update
     if (!Update.end(true)) {
         lastError = "update_end_failed";
-        SerialMon.println("Update.end() failed");
+        OTA_LOG("Update.end() failed");
         return false;
     }
 
-    SerialMon.println("Update completed successfully!");
+    SerialMon.println("OTA SUCCESS!");
     return true;
 }
 
